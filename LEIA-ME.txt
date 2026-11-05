@@ -1,0 +1,234 @@
+DASHBOARD COMERCIAL MEDIATORIE - VERSÃO COM RELATÓRIO PDF
+
+ESTE É O PROJETO COMERCIAL.
+
+Arquivos para subir juntos no Git / Streamlit Cloud:
+
+app.py
+relatorio_pdf_comercial.py
+requirements.txt
+logo_mediatorie.png
+.streamlit/
+    config.toml
+
+O relatório PDF considera o recorte atual dos filtros:
+- Competência
+- Material
+- Corretora
+- Vendedor
+
+O PDF contém:
+- resumo executivo;
+- Saúde e Odonto por competência;
+- Vendido x Meta de Saúde;
+- Vendido x Meta de Odonto;
+- produção por executivo;
+- produtos mais vendidos;
+- maiores corretoras;
+- maiores vendedores;
+- ranking por entidade;
+- distribuição por tipo de produto;
+- regras utilizadas.
+
+IMPORTANTE SOBRE METAS
+Quando Material, Corretora ou Vendedor estiverem filtrados, o "Vendido"
+é recalculado para o recorte selecionado, mas a meta continua sendo
+a meta corporativa mensal cadastrada no dashboard.
+
+COMO USAR
+1. Suba as duas planilhas.
+2. Aplique os filtros desejados.
+3. Clique em "Gerar relatório PDF".
+4. Clique em "Baixar relatório PDF".
+
+
+ATUALIZAÇÃO - VENDEDORES INTERNOS
+
+Vendedores acompanhados:
+- RENAN AVELINO RICARDO
+- GENIANE CAUS
+- FERNANDA PEREIRA SANTANA
+
+A visão mostra Saúde e Odonto por competência utilizando as mesmas regras
+homologadas do Dashboard Comercial.
+
+A visão respeita os filtros:
+- Competência
+- Material
+- Corretora
+
+O filtro global Vendedor é ignorado dentro da aba Vendedores Internos para
+garantir a exibição dos três vendedores.
+
+ATUALIZAÇÃO - PREVISÃO DE VENDAS
+
+Foi criada uma área para:
+- importar a planilha no modelo da Reunião Semanal;
+- visualizar vidas prospectadas por vendedor;
+- visualizar vidas por Status da Negociação;
+- filtrar vendedor e status;
+- incluir novos registros;
+- editar registros existentes;
+- excluir/adicionar linhas pela tabela;
+- baixar a base atualizada em Excel.
+
+Campos:
+- Vendedor
+- Empresa
+- Plano de Saúde
+- Plano Odonto
+- Pessoa de Contato
+- Data Base
+- Status da Negociação
+- Vidas
+
+A importação reconhece os nomes usados no modelo:
+- Renan Avelino -> RENAN AVELINO RICARDO
+- Geniane Caus -> GENIANE CAUS
+- Fernanda Santana -> FERNANDA PEREIRA SANTANA
+
+Os registros manuais ficam na sessão atual. Para armazenamento permanente
+entre usuários/reinicializações, será necessário usar Google Sheets ou banco.
+
+
+ATUALIZAÇÃO DO PDF - VENDEDORES INTERNOS
+
+O relatório gerencial em PDF agora inclui:
+- resumo total dos Vendedores Internos;
+- Saúde e Odonto;
+- Renan Avelino Ricardo por competência;
+- Geniane Caus por competência;
+- Fernanda Pereira Santana por competência;
+- tabela de consolidação por competência para cada vendedor.
+
+A visão do PDF utiliza o mesmo DataFrame da aba Vendedores Internos.
+
+
+ATUALIZAÇÃO DO RELATÓRIO PDF
+
+1. Vendedores Internos
+- legenda reposicionada para não sobrepor o título;
+- Saúde e Odonto continuam separados por competência.
+
+2. Previsão de Vendas
+O PDF agora inclui:
+- Oportunidades;
+- Vidas prospectadas;
+- Vendedores;
+- Status distintos;
+- gráfico de vidas prospectadas por vendedor;
+- gráfico de vidas por status da negociação;
+- tabela das oportunidades.
+
+3. Executivos
+Foi criada uma aba Executivos no dashboard.
+Os gráficos de Saúde e Odonto são exibidos verticalmente, um abaixo do outro.
+O mesmo padrão foi aplicado ao relatório PDF.
+
+
+ATUALIZAÇÃO - PRODUÇÃO X EVASÃO POR CORRETORA
+
+Foi criada a aba "Produção x Evasão".
+
+PRODUÇÃO
+- Descrição Cancelamento vazia;
+- Tipo Movimentação = VIDA NOVA;
+- Competência pela Data Inclusão Vida.
+
+EVASÃO
+- Descrição Cancelamento preenchida;
+- Tipo Movimentação = VIDA NOVA;
+- Competência pela Data Fim Beneficiário;
+- motivos considerados:
+  DESLIGAMENTO DA EMPRESA (RN279)
+  DESISTÊNCIA
+  BENEFÍCIO DEMITIDO/APOSENTADO (RN279)
+  A PEDIDO DO BENEFICIÁRIO (RN561)
+  SEM JUSTA CAUSA
+  ATEN ADM - CANCELAMENTO DE CONTRATO
+  INADIMPLENTE
+  ÓBITO
+  RECISÃO POR ACORDO
+  JUSTA CAUSA
+
+SALDO
+Saldo = Quantidade de Produção - Quantidade de Evasões
+
+A aba contém:
+- filtro próprio de Competência;
+- filtro próprio de Corretora;
+- KPIs de Produção, Evasão e Saldo;
+- gráfico Produção x Evasão por competência;
+- saldo por corretora;
+- motivos de evasão;
+- tabela detalhada;
+- download em Excel com saldo e motivos.
+
+
+CORREÇÃO - PRODUÇÃO X EVASÃO
+
+A aba Produção x Evasão agora usa os filtros centrais do Dashboard Comercial:
+- Competência
+- Material
+- Corretora
+- Vendedor
+
+Os filtros duplicados dentro da aba foram removidos.
+
+PRODUÇÃO
+A Produção é o mesmo realizado que alimenta os KPIs Saúde + Odonto.
+Portanto, o total de Produção deve reconciliar com Saúde + Odonto no topo.
+
+EVASÃO
+- Data Fim Beneficiário válida
+- Competência pela Data Fim Beneficiário
+- Tipo Movimentação = VIDA NOVA
+- Motivos considerados:
+  SEM JUSTA CAUSA
+  JUSTA CAUSA
+  A PEDIDO DO BENEFICIÁRIO (RN561)
+  BENEFÍCIO DEMITIDO/APOSENTADO (RN279)
+  DESLIGAMENTO DA EMPRESA (RN279)
+  INADIMPLENTE
+
+SALDO
+Saldo = Produção - Evasão por Competência + Corretora.
+
+
+REGRA DEFINITIVA DE COMPETÊNCIA - PRODUÇÃO X EVASÃO
+
+PRODUÇÃO
+Competencia_Producao = Data Inclusão Vida
+
+EVASÃO
+Competencia_Evasao = Data Fim Beneficiário
+
+O filtro central de competência é aplicado separadamente:
+- na Data Inclusão Vida para Produção;
+- na Data Fim Beneficiário para Evasão.
+
+Exemplo:
+Uma vida incluída em 03/2026 e cancelada em 09/2026:
+- conta como Produção em 03/2026;
+- conta como Evasão em 09/2026;
+- o cancelamento não altera a competência original da produção.
+
+SALDO MENSAL
+Saldo = Produção do mês - Evasão do mês
+
+
+CORREÇÃO DE COMPATIBILIDADE - PDF / STREAMLIT CLOUD
+
+Foi corrigido o tratamento dos nomes utilizados nos gráficos do PDF.
+
+Problema anterior:
+o Pandas do Streamlit Cloud podia entregar valores numéricos/nulos no índice
+do ranking de executivos, e o código tentava executar len() diretamente nesses valores.
+
+Correção:
+- todo nome é convertido explicitamente para texto;
+- valores nulos viram "Não informado";
+- ranking genérico recebeu a mesma proteção;
+- quantidades são convertidas com pd.to_numeric antes do gráfico.
+
+Essa correção não altera nenhuma regra comercial ou cálculo.

@@ -1,0 +1,4363 @@
+from __future__ import annotations
+
+from io import BytesIO
+from pathlib import Path
+import hashlib
+import unicodedata
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from relatorio_pdf_comercial import gerar_relatorio_comercial_pdf
+
+from pipeline_vendedores_internos import (
+    VENDEDORES_INTERNOS,
+    COLUNAS_PIPELINE,
+    canonizar_vendedor,
+    carregar_pipeline_excel,
+    exportar_pipeline_excel,
+    preparar_pipeline,
+)
+
+
+# =========================================================
+# CONFIGURAÇÃO DA PÁGINA
+# =========================================================
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_PATH = BASE_DIR / "logo_mediatorie.png"
+
+st.set_page_config(
+    page_title="Dashboard Comercial | Mediatorie",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 3.8rem !important;
+            padding-bottom: 2rem;
+            max-width: 1500px;
+        }
+
+        [data-testid="stSidebar"] {
+            background-color: #F5F7F2;
+        }
+
+        [data-testid="stMetric"] {
+            background: white;
+            border: 1px solid #E4E9DF;
+            border-left: 5px solid #86BC25;
+            border-radius: 10px;
+            padding: 12px 15px;
+        }
+
+        .titulo-mediatorie {
+            font-size: 2rem;
+            font-weight: 750;
+            color: #343A36;
+            margin-bottom: 2px;
+        }
+
+        .subtitulo-mediatorie {
+            color: #6B736D;
+            font-size: 1rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# REGRAS FIXAS DO PROCESSO
+# =========================================================
+DESCRICOES_CANCELAMENTO_VALIDAS = [
+    "SEM JUSTA CAUSA",
+    "JUSTA CAUSA",
+    "A PEDIDO DO BENEFICIÁRIO (RN561)",
+    "BENEFÍCIO DEMITIDO/APOSENTADO (RN279)",
+    "DESLIGAMENTO DA EMPRESA (RN279)",
+    "INADIMPLENTE",
+    "DESISTÊNCIA",
+    "ÓBITO",
+    "RECISÃO POR ACORDO",
+    "ATEN ADM - CANCELAMENTO DE CONTRATO"
+]
+
+CANCELAMENTOS_EVASAO = [
+    "SEM JUSTA CAUSA",
+    "JUSTA CAUSA",
+    "A PEDIDO DO BENEFICIÁRIO (RN561)",
+    "BENEFÍCIO DEMITIDO/APOSENTADO (RN279)",
+    "DESLIGAMENTO DA EMPRESA (RN279)",
+    "INADIMPLENTE",
+    "DESISTÊNCIA",
+    "ÓBITO",
+    "RECISÃO POR ACORDO",
+    "ATEN ADM - CANCELAMENTO DE CONTRATO"
+    
+]
+
+DATA_CORTE = pd.Timestamp("2025-12-01")
+
+
+# =========================================================
+# COLUNAS OBRIGATÓRIAS
+# =========================================================
+COLUNAS_BASE_TOTAL = [
+    "Id Corretora",
+    "Tipo Movimentação",
+    "Data Início Beneficiário",
+    "Data Inclusão Vida",
+    "Data Fim Beneficiário",
+    "Descrição Status Atual Beneficiário",
+    "Descrição Cancelamento",
+    "Id Acomodação",
+    "Descrição Beneficiário",
+    "Descrição Material",
+    "Descrição Corretora",
+    "Descrição Vendedor",
+    "Descrição Entidade",
+]
+
+COLUNAS_CARTEIRA = [
+    "ID Parceiro",
+    "NOME",
+]
+
+
+# =========================================================
+# LEITURA
+# =========================================================
+@st.cache_data(show_spinner=False, max_entries=4)
+def ler_excel_upload(nome: str, conteudo: bytes) -> pd.DataFrame:
+    """
+    Lê o arquivo uma única vez e mantém em cache entre os reruns
+    do Streamlit. Isso é importante principalmente para a base total.
+    """
+    return pd.read_excel(BytesIO(conteudo))
+
+
+def validar_colunas(
+    df: pd.DataFrame,
+    colunas_obrigatorias: list[str],
+    nome_base: str,
+) -> None:
+    faltantes = [
+        coluna
+        for coluna in colunas_obrigatorias
+        if coluna not in df.columns
+    ]
+
+    if faltantes:
+        raise KeyError(
+            f"{nome_base}: faltam as colunas: "
+            + ", ".join(faltantes)
+        )
+
+
+def normalizar_cabecalho(texto: str) -> str:
+    texto = str(texto).strip()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    return " ".join(texto.upper().split())
+
+
+def localizar_coluna(
+    df: pd.DataFrame,
+    candidatos: list[str],
+) -> str | None:
+    mapa = {
+        normalizar_cabecalho(coluna): coluna
+        for coluna in df.columns
+    }
+
+    for candidato in candidatos:
+        chave = normalizar_cabecalho(candidato)
+        if chave in mapa:
+            return mapa[chave]
+
+    return None
+
+
+def padronizar_colunas_comerciais(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Mantém nomes canônicos no restante do código, aceitando pequenas
+    diferenças de cabeçalho encontradas nas planilhas.
+    """
+    df = df.copy()
+
+    aliases = {
+        "Descrição Material": [
+            "Descrição Material",
+            "Descricao Material",
+        ],
+        "Descrição Corretora": [
+            "Descrição Corretora",
+            "Descrição de Corretora",
+            "Descricao Corretora",
+            "Descricao de Corretora",
+        ],
+        "Descrição Vendedor": [
+            "Descrição Vendedor",
+            "Descrição Vendendor",
+            "Descricao Vendedor",
+            "Descricao Vendendor",
+        ],
+        "Descrição Entidade": [
+            "Descrição Entidade",
+            "Descricao Entidade",
+            "Entidade",
+            "Nome Entidade",
+        ],
+    }
+
+    renomear = {}
+
+    for nome_padrao, candidatos in aliases.items():
+        if nome_padrao in df.columns:
+            continue
+
+        encontrada = localizar_coluna(
+            df,
+            candidatos,
+        )
+
+        if encontrada is not None:
+            renomear[encontrada] = nome_padrao
+
+    if renomear:
+        df = df.rename(columns=renomear)
+
+    return df
+
+
+# =========================================================
+# EVASÃO POR CORRETORA
+# =========================================================
+@st.cache_data(show_spinner=False, max_entries=2)
+def preparar_base_evasao(
+    nome_base: str,
+    bytes_base: bytes,
+) -> pd.DataFrame:
+    """Prepara a base de evasão conforme a regra homologada.
+
+    Regra:
+    - Data Fim Beneficiário válida;
+    - Tipo Movimentação = VIDA NOVA;
+    - Descrição Cancelamento em CANCELAMENTOS_EVASAO;
+    - Competência pela Data Fim Beneficiário.
+    """
+
+    df = ler_excel_upload(
+        nome_base,
+        bytes_base,
+    ).copy()
+
+    df.columns = (
+        df.columns
+        .astype(str)
+        .str.strip()
+    )
+
+    df = padronizar_colunas_comerciais(
+        df
+    )
+
+    colunas_necessarias = [
+        "Descrição Cancelamento",
+        "Data Fim Beneficiário",
+        "Tipo Movimentação",
+        "Descrição Corretora",
+        "Descrição Material",
+        "Descrição Vendedor",
+    ]
+
+    validar_colunas(
+        df,
+        colunas_necessarias,
+        "Base Total - Evasão",
+    )
+
+    df["Data Fim Beneficiário"] = pd.to_datetime(
+        df["Data Fim Beneficiário"],
+        dayfirst=True,
+        errors="coerce",
+    )
+
+    df_evasao = df[
+        df["Data Fim Beneficiário"].notna()
+    ].copy()
+
+    # Competência de EVASÃO:
+    # sempre vinculada à Data Fim Beneficiário.
+    df_evasao["Competencia_Evasao"] = (
+        df_evasao["Data Fim Beneficiário"]
+        .dt.strftime("%m/%Y")
+    )
+
+    df_evasao = df_evasao[
+        df_evasao["Tipo Movimentação"].eq(
+            "VIDA NOVA"
+        )
+    ].copy()
+
+    df_evasao = df_evasao[
+        df_evasao["Descrição Cancelamento"].isin(
+            CANCELAMENTOS_EVASAO
+        )
+    ].copy()
+
+    # Padronização igual aos filtros centrais.
+    for coluna in [
+        "Descrição Material",
+        "Descrição Corretora",
+        "Descrição Vendedor",
+    ]:
+        df_evasao[coluna] = (
+            df_evasao[coluna]
+            .astype("string")
+            .fillna("Não informado")
+            .str.strip()
+            .replace("", "Não informado")
+        )
+
+    return df_evasao.reset_index(
+        drop=True
+    )
+
+
+def montar_producao_evasao(
+    df_comercial_filtrado: pd.DataFrame,
+    df_evasao_base: pd.DataFrame,
+    competencias_selecionadas: list[str],
+    materiais_selecionados: list[str],
+    corretoras_selecionadas: list[str],
+    vendedores_selecionados: list[str],
+):
+    """Monta Produção x Evasão usando duas competências independentes.
+
+    PRODUÇÃO
+    ----------
+    A competência é SEMPRE vinculada à Data Inclusão Vida.
+
+        Competencia_Producao = Data Inclusão Vida
+
+    A produção utiliza o mesmo realizado comercial válido do dashboard
+    e continua reconciliando com Saúde + Odonto.
+
+    EVASÃO
+    ------
+    A competência é SEMPRE vinculada à Data Fim Beneficiário.
+
+        Competencia_Evasao = Data Fim Beneficiário
+
+    A evasão conta os registros de cancelamento já filtrados em
+    preparar_base_evasao().
+
+    IMPORTANTE
+    ----------
+    A mesma vida pode aparecer como Produção em um mês e como Evasão
+    em outro mês. A evasão posterior não altera a competência original
+    da produção.
+    """
+
+    # =====================================================
+    # PRODUÇÃO
+    # Competência = Data Inclusão Vida
+    # =====================================================
+    df_producao = df_comercial_filtrado.copy()
+
+    # Saúde + Odonto:
+    # Saúde exclui ODO/SEM e Odonto considera ODO.
+    # Para a produção consolidada excluímos somente SEM.
+    df_producao = df_producao[
+        ~df_producao["Id Acomodação"].eq(
+            "SEM"
+        )
+    ].copy()
+
+    df_producao["Data Inclusão Vida"] = pd.to_datetime(
+        df_producao["Data Inclusão Vida"],
+        dayfirst=True,
+        errors="coerce",
+    )
+
+    df_producao["Competencia_Producao"] = (
+        df_producao["Data Inclusão Vida"]
+        .dt.strftime("%m/%Y")
+    )
+
+    # Mantém o mesmo filtro central de competência,
+    # mas aplicado à competência correta da Produção.
+    df_producao = df_producao[
+        df_producao["Competencia_Producao"].isin(
+            competencias_selecionadas
+        )
+    ].copy()
+
+    df_producao["Descrição Corretora"] = (
+        df_producao["Descrição Corretora"]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+    )
+
+    producao_corretora = (
+        df_producao
+        .groupby(
+            [
+                "Competencia_Producao",
+                "Descrição Corretora",
+            ],
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Competencia_Producao": "Competencia",
+                "Descrição Beneficiário": "Quantidade de Producao",
+            }
+        )
+    )
+
+    # =====================================================
+    # EVASÃO
+    # Competência = Data Fim Beneficiário
+    # =====================================================
+    df_evasao = df_evasao_base[
+        df_evasao_base["Competencia_Evasao"].isin(
+            competencias_selecionadas
+        )
+        & df_evasao_base["Descrição Material"].isin(
+            materiais_selecionados
+        )
+        & df_evasao_base["Descrição Corretora"].isin(
+            corretoras_selecionadas
+        )
+        & df_evasao_base["Descrição Vendedor"].isin(
+            vendedores_selecionados
+        )
+    ].copy()
+
+    evasao_corretora = (
+        df_evasao
+        .groupby(
+            [
+                "Competencia_Evasao",
+                "Descrição Corretora",
+            ],
+            dropna=False,
+        )
+        .size()
+        .reset_index(
+            name="Quantidade de Evasões"
+        )
+        .rename(
+            columns={
+                "Competencia_Evasao": "Competencia",
+            }
+        )
+    )
+
+    evasao_corretora_motivos = (
+        df_evasao
+        .groupby(
+            [
+                "Competencia_Evasao",
+                "Descrição Corretora",
+                "Descrição Cancelamento",
+            ],
+            dropna=False,
+        )
+        .size()
+        .reset_index(
+            name="Quantidade de Evasões"
+        )
+        .rename(
+            columns={
+                "Competencia_Evasao": "Competencia",
+            }
+        )
+    )
+
+    # =====================================================
+    # SALDO
+    # Só aqui as duas competências são colocadas lado a lado:
+    # Produção do mês - Evasão do mesmo mês.
+    # =====================================================
+    saldo_corretoras = pd.merge(
+        producao_corretora,
+        evasao_corretora,
+        how="outer",
+        on=[
+            "Competencia",
+            "Descrição Corretora",
+        ],
+    )
+
+    for coluna in [
+        "Quantidade de Producao",
+        "Quantidade de Evasões",
+    ]:
+        saldo_corretoras[coluna] = (
+            saldo_corretoras[coluna]
+            .fillna(0)
+            .astype(int)
+        )
+
+    saldo_corretoras["Descrição Corretora"] = (
+        saldo_corretoras["Descrição Corretora"]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+    )
+
+    saldo_corretoras["Saldo"] = (
+        saldo_corretoras["Quantidade de Producao"]
+        - saldo_corretoras["Quantidade de Evasões"]
+    )
+
+    saldo_corretoras = (
+        saldo_corretoras
+        .sort_values(
+            [
+                "Competencia",
+                "Descrição Corretora",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    return (
+        saldo_corretoras,
+        evasao_corretora_motivos,
+        df_producao,
+        df_evasao,
+    )
+
+
+def exportar_producao_evasao_excel(
+    saldo: pd.DataFrame,
+    motivos: pd.DataFrame,
+) -> bytes:
+    buffer = BytesIO()
+
+    saldo_export = saldo.copy()
+    motivos_export = motivos.copy()
+
+    with pd.ExcelWriter(
+        buffer,
+        engine="openpyxl",
+    ) as writer:
+        saldo_export.to_excel(
+            writer,
+            sheet_name="Saldo Corretoras",
+            index=False,
+        )
+
+        motivos_export.to_excel(
+            writer,
+            sheet_name="Motivos Evasão",
+            index=False,
+        )
+
+    buffer.seek(0)
+
+    return buffer.getvalue()
+
+
+# =========================================================
+# PROCESSAMENTO
+# =========================================================
+@st.cache_data(show_spinner=False, max_entries=2)
+def processar_bases(
+    nome_base: str,
+    bytes_base: bytes,
+    nome_carteira: str,
+    bytes_carteira: bytes,
+):
+    """
+    REPRODUÇÃO DIRETA DO PROCESSO HOMOLOGADO NO NOTEBOOK.
+
+    Não usa nunique.
+    Não altera a chave do merge.
+    Não altera os filtros.
+    Não altera os groupbys.
+    """
+
+    # -----------------------------------------------------
+    # 1. LEITURA
+    # -----------------------------------------------------
+    df = ler_excel_upload(nome_base, bytes_base).copy()
+    carteira_exec = ler_excel_upload(
+        nome_carteira,
+        bytes_carteira,
+    ).copy()
+
+    df.columns = df.columns.astype(str).str.strip()
+    carteira_exec.columns = (
+        carteira_exec.columns.astype(str).str.strip()
+    )
+
+    df = padronizar_colunas_comerciais(df)
+
+    validar_colunas(
+        df,
+        COLUNAS_BASE_TOTAL,
+        "Base Total",
+    )
+    validar_colunas(
+        carteira_exec,
+        COLUNAS_CARTEIRA,
+        "Carteira de Executivos",
+    )
+
+    # -----------------------------------------------------
+    # 2. MERGE - EXATAMENTE COMO NO CÓDIGO ORIGINAL
+    # -----------------------------------------------------
+    df = pd.merge(
+        df,
+        carteira_exec,
+        how="left",
+        right_on="ID Parceiro",
+        left_on="Id Corretora",
+    )
+
+    # -----------------------------------------------------
+    # 3. SOMENTE VIDA NOVA
+    # -----------------------------------------------------
+    df = df[
+        df["Tipo Movimentação"] == "VIDA NOVA"
+    ].copy()
+
+    # -----------------------------------------------------
+    # 4. DATAS E DIFERENÇA
+    # -----------------------------------------------------
+    df["Data Início Beneficiário"] = pd.to_datetime(
+        df["Data Início Beneficiário"],
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    df["Data Inclusão Vida"] = pd.to_datetime(
+        df["Data Inclusão Vida"],
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    df["Diferenca"] = (
+        df["Data Inclusão Vida"]
+        - df["Data Início Beneficiário"]
+    ).dt.days
+
+    # -----------------------------------------------------
+    # 5. DESCRIÇÃO DE CANCELAMENTO - NOVA REGRA HOMOLOGADA
+    # -----------------------------------------------------
+    # Mantém registros cuja descrição esteja na lista permitida
+    # OU esteja vazia/nula.
+    #
+    # Observação:
+    # df["Descrição Cancelamento"].isnull() não deve ficar dentro
+    # da lista passada ao .isin(); a condição de nulo é aplicada
+    # separadamente com OR.
+    mascara_cancelamento = (
+        df["Descrição Cancelamento"].isin(
+            DESCRICOES_CANCELAMENTO_VALIDAS
+        )
+        | df["Descrição Cancelamento"].isna()
+    )
+
+    df = df[
+        mascara_cancelamento
+    ].copy()
+
+    # -----------------------------------------------------
+    # 6. REGISTROS NÃO CORRETOS
+    # -----------------------------------------------------
+    df_nao_corretos = df[
+        df["Diferenca"] > 0
+    ].copy()
+
+    df_nao_corretos = df_nao_corretos[
+        df_nao_corretos[
+            "Descrição Status Atual Beneficiário"
+        ] == "Ativado"
+    ].copy()
+
+    colunas_nao_corretos = [
+        "Descrição Beneficiário",
+        "Data Início Beneficiário",
+        "Data Inclusão Vida",
+        "Diferenca",
+    ]
+
+    df_nao_corretoss = df_nao_corretos[
+        colunas_nao_corretos
+    ].copy()
+
+    # -----------------------------------------------------
+    # 7. REGISTROS CORRETOS
+    # -----------------------------------------------------
+    df_certo = df[
+        df["Diferenca"] <= 0
+    ].copy()
+
+    df_certo["Data Inclusão Vida"] = pd.to_datetime(
+        df_certo["Data Inclusão Vida"],
+        dayfirst=True,
+        errors="coerce",
+    )
+
+    df_certo["Competencia"] = (
+        df_certo["Data Inclusão Vida"]
+        .dt.strftime("%m/%Y")
+    )
+
+    # -----------------------------------------------------
+    # 8. SAÚDE
+    # Exclui ODO e SEM
+    # -----------------------------------------------------
+    ACOM_SAUDE = ["ODO", "SEM"]
+
+    df_saude = df_certo[
+        ~df_certo["Id Acomodação"].isin(
+            ACOM_SAUDE
+        )
+    ].copy()
+
+    # -----------------------------------------------------
+    # 9. ODONTO
+    # Somente ODO
+    # -----------------------------------------------------
+    ACOM_ODONTO = ["ODO"]
+
+    df_odonto = df_certo[
+        df_certo["Id Acomodação"].isin(
+            ACOM_ODONTO
+        )
+    ].copy()
+
+    # -----------------------------------------------------
+    # 10. SAÚDE - COMPETÊNCIA + EXECUTIVO
+    # -----------------------------------------------------
+    df_saude_agru_comp_analista = (
+        df_saude
+        .groupby(
+            ["Competencia", "NOME"]
+        )
+        .agg(
+            {
+                "Id Corretora": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_saude_agru_comp_analista[
+        "Competencia"
+    ] = pd.to_datetime(
+        df_saude_agru_comp_analista[
+            "Competencia"
+        ],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_saude_agru_comp_analista = (
+        df_saude_agru_comp_analista[
+            df_saude_agru_comp_analista[
+                "Competencia"
+            ] > DATA_CORTE
+        ]
+        .sort_values(
+            ["Competencia", "NOME"]
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 11. ODONTO - COMPETÊNCIA + EXECUTIVO
+    # -----------------------------------------------------
+    df_odonto_agru_comp_analista = (
+        df_odonto
+        .groupby(
+            ["Competencia", "NOME"]
+        )
+        .agg(
+            {
+                "Id Corretora": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_odonto_agru_comp_analista[
+        "Competencia"
+    ] = pd.to_datetime(
+        df_odonto_agru_comp_analista[
+            "Competencia"
+        ],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_odonto_agru_comp_analista = (
+        df_odonto_agru_comp_analista[
+            df_odonto_agru_comp_analista[
+                "Competencia"
+            ] > DATA_CORTE
+        ]
+        .sort_values(
+            ["Competencia", "NOME"]
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 12. SAÚDE - TOTAL POR COMPETÊNCIA
+    # -----------------------------------------------------
+    df_saude_group = (
+        df_saude
+        .groupby("Competencia")
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_saude_group["Competencia"] = (
+        pd.to_datetime(
+            df_saude_group["Competencia"],
+            format="%m/%Y",
+            errors="coerce",
+        )
+    )
+
+    df_saude_group = (
+        df_saude_group[
+            df_saude_group[
+                "Competencia"
+            ] > DATA_CORTE
+        ]
+        .sort_values("Competencia")
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 13. ODONTO - TOTAL POR COMPETÊNCIA
+    # -----------------------------------------------------
+    df_odonto_group = (
+        df_odonto
+        .groupby("Competencia")
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_odonto_group["Competencia"] = (
+        pd.to_datetime(
+            df_odonto_group["Competencia"],
+            format="%m/%Y",
+            errors="coerce",
+        )
+    )
+
+    df_odonto_group = (
+        df_odonto_group[
+            df_odonto_group[
+                "Competencia"
+            ] > DATA_CORTE
+        ]
+        .sort_values("Competencia")
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 14. BASE COMERCIAL VÁLIDA PARA OS NOVOS RANKINGS
+    # Mesmas regras já aplicadas acima + competência 01/2026+
+    # -----------------------------------------------------
+    df_comercial = df_certo.copy()
+
+    df_comercial["Competencia_Data"] = pd.to_datetime(
+        df_comercial["Competencia"],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_comercial = (
+        df_comercial[
+            df_comercial["Competencia_Data"] > DATA_CORTE
+        ]
+        .copy()
+    )
+
+    # -----------------------------------------------------
+    # 15. CLASSIFICAÇÃO DO TIPO DE PRODUTO
+    # -----------------------------------------------------
+    acomodacao = (
+        df_comercial["Id Acomodação"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+    mapa_tipo_produto = {
+        "AMB": "Ambulatorial",
+        "ENF": "Completo",
+        "QUA": "Completo",
+        "ODO": "Odonto",
+    }
+
+    df_comercial["Tipo Produto"] = (
+        acomodacao
+        .map(mapa_tipo_produto)
+        .fillna("Não classificado")
+    )
+
+    # -----------------------------------------------------
+    # 16. PRODUTOS MAIS VENDIDOS
+    # Regra: Descrição Material -> count(Descrição Beneficiário)
+    # -----------------------------------------------------
+    df_produtos_ranking = (
+        df_comercial
+        .assign(
+            **{
+                "Descrição Material": (
+                    df_comercial["Descrição Material"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Material",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 17. MAIORES CORRETORAS
+    # Regra: Descrição Corretora -> count(Descrição Beneficiário)
+    # -----------------------------------------------------
+    df_corretoras_ranking = (
+        df_comercial
+        .assign(
+            **{
+                "Descrição Corretora": (
+                    df_comercial["Descrição Corretora"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Corretora",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 18. MAIORES VENDEDORES
+    # Regra: Descrição Vendedor -> count(Descrição Beneficiário)
+    # -----------------------------------------------------
+    df_vendedores_ranking = (
+        df_comercial
+        .assign(
+            **{
+                "Descrição Vendedor": (
+                    df_comercial["Descrição Vendedor"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Vendedor",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # 19. DISTRIBUIÇÃO POR TIPO DE PRODUTO
+    # -----------------------------------------------------
+    df_tipo_produto = (
+        df_comercial
+        .groupby(
+            "Tipo Produto",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    # Formatação da data apenas na base detalhada.
+    df_certo["Data Inclusão Vida"] = (
+        df_certo["Data Inclusão Vida"]
+        .dt.strftime("%d/%m/%Y")
+    )
+
+    return (
+        df,
+        df_certo,
+        df_nao_corretoss,
+        df_saude,
+        df_odonto,
+        df_saude_agru_comp_analista,
+        df_odonto_agru_comp_analista,
+        df_saude_group,
+        df_odonto_group,
+        df_comercial,
+        df_produtos_ranking,
+        df_corretoras_ranking,
+        df_vendedores_ranking,
+        df_tipo_produto,
+    )
+
+
+# =========================================================
+# GRÁFICOS
+# =========================================================
+def grafico_total_competencia(
+    dados: pd.DataFrame,
+    titulo: str,
+) -> go.Figure:
+    fig = go.Figure()
+
+    fig.add_bar(
+        x=dados["Competencia"],
+        y=dados["Descrição Beneficiário"],
+        text=dados["Descrição Beneficiário"],
+        textposition="outside",
+        marker_color="#86BC25",
+        hovertemplate=(
+            "<b>%{x|%m/%Y}</b><br>"
+            "Quantidade: %{y}<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        title=titulo,
+        height=430,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(
+            l=35,
+            r=25,
+            t=70,
+            b=50,
+        ),
+        showlegend=False,
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Competência",
+        tickformat="%m/%Y",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade de beneficiários",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+def grafico_por_executivo(
+    dados: pd.DataFrame,
+    titulo: str,
+) -> go.Figure:
+    plot = dados.copy()
+    plot["Competencia_Label"] = (
+        plot["Competencia"].dt.strftime("%m/%Y")
+    )
+
+    fig = px.bar(
+        plot,
+        x="Competencia_Label",
+        y="Id Corretora",
+        color="NOME",
+        barmode="group",
+        text="Id Corretora",
+    )
+
+    fig.update_traces(
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{fullData.name}</b><br>"
+            "Competência: %{x}<br>"
+            "Quantidade: %{y}<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        title=titulo,
+        height=520,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(
+            l=35,
+            r=25,
+            t=75,
+            b=55,
+        ),
+        legend_title="Executivo",
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Competência",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Contagem de Id Corretora",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+
+
+
+def recalcular_visoes_filtradas(
+    df_filtrado: pd.DataFrame,
+):
+    """
+    Recalcula Saúde, Odonto, executivos e rankings depois dos filtros globais.
+
+    A base recebida já passou por todas as regras homologadas:
+    - merge da carteira;
+    - VIDA NOVA;
+    - regra de Descrição Cancelamento;
+    - Diferenca <= 0;
+    - competência a partir de 01/2026.
+    """
+
+    # -----------------------------------------------------
+    # SAÚDE / ODONTO
+    # -----------------------------------------------------
+    df_saude = df_filtrado[
+        ~df_filtrado["Id Acomodação"].isin(
+            ["ODO", "SEM"]
+        )
+    ].copy()
+
+    df_odonto = df_filtrado[
+        df_filtrado["Id Acomodação"].isin(
+            ["ODO"]
+        )
+    ].copy()
+
+    # -----------------------------------------------------
+    # SAÚDE POR EXECUTIVO
+    # -----------------------------------------------------
+    df_saude_exec = (
+        df_saude
+        .groupby(
+            ["Competencia", "NOME"],
+            dropna=False,
+        )
+        .agg(
+            {
+                "Id Corretora": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_saude_exec["Competencia"] = pd.to_datetime(
+        df_saude_exec["Competencia"],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_saude_exec = (
+        df_saude_exec
+        .sort_values(
+            ["Competencia", "NOME"]
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # ODONTO POR EXECUTIVO
+    # -----------------------------------------------------
+    df_odonto_exec = (
+        df_odonto
+        .groupby(
+            ["Competencia", "NOME"],
+            dropna=False,
+        )
+        .agg(
+            {
+                "Id Corretora": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_odonto_exec["Competencia"] = pd.to_datetime(
+        df_odonto_exec["Competencia"],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_odonto_exec = (
+        df_odonto_exec
+        .sort_values(
+            ["Competencia", "NOME"]
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # SAÚDE POR COMPETÊNCIA
+    # -----------------------------------------------------
+    df_saude_comp = (
+        df_saude
+        .groupby(
+            "Competencia",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_saude_comp["Competencia"] = pd.to_datetime(
+        df_saude_comp["Competencia"],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_saude_comp = (
+        df_saude_comp
+        .sort_values("Competencia")
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # ODONTO POR COMPETÊNCIA
+    # -----------------------------------------------------
+    df_odonto_comp = (
+        df_odonto
+        .groupby(
+            "Competencia",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+    )
+
+    df_odonto_comp["Competencia"] = pd.to_datetime(
+        df_odonto_comp["Competencia"],
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    df_odonto_comp = (
+        df_odonto_comp
+        .sort_values("Competencia")
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # RANKING GENÉRICO
+    # -----------------------------------------------------
+    def ranking_por(coluna: str) -> pd.DataFrame:
+        base = df_filtrado.copy()
+
+        base[coluna] = (
+            base[coluna]
+            .astype("string")
+            .fillna("Não informado")
+            .str.strip()
+            .replace("", "Não informado")
+        )
+
+        return (
+            base
+            .groupby(
+                coluna,
+                dropna=False,
+            )
+            .agg(
+                {
+                    "Descrição Beneficiário": "count",
+                }
+            )
+            .reset_index()
+            .rename(
+                columns={
+                    "Descrição Beneficiário": "Quantidade",
+                }
+            )
+            .sort_values(
+                "Quantidade",
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+
+    df_produtos_ranking = ranking_por(
+        "Descrição Material"
+    )
+
+    df_corretoras_ranking = ranking_por(
+        "Descrição Corretora"
+    )
+
+    df_vendedores_ranking = ranking_por(
+        "Descrição Vendedor"
+    )
+
+    df_entidades_ranking = ranking_por(
+        "Descrição Entidade"
+    )
+
+    df_tipo_produto = (
+        df_filtrado
+        .groupby(
+            "Tipo Produto",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    return (
+        df_saude_exec,
+        df_odonto_exec,
+        df_saude_comp,
+        df_odonto_comp,
+        df_produtos_ranking,
+        df_corretoras_ranking,
+        df_vendedores_ranking,
+        df_entidades_ranking,
+        df_tipo_produto,
+    )
+
+
+
+def recalcular_rankings_comerciais(
+    df_comercial_filtrado: pd.DataFrame,
+):
+    """
+    Recalcula todos os rankings comerciais depois do filtro de competência.
+    Mantém as mesmas regras já homologadas.
+    """
+
+    df_produtos_ranking = (
+        df_comercial_filtrado
+        .assign(
+            **{
+                "Descrição Material": (
+                    df_comercial_filtrado["Descrição Material"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Material",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    df_corretoras_ranking = (
+        df_comercial_filtrado
+        .assign(
+            **{
+                "Descrição Corretora": (
+                    df_comercial_filtrado["Descrição Corretora"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Corretora",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    df_vendedores_ranking = (
+        df_comercial_filtrado
+        .assign(
+            **{
+                "Descrição Vendedor": (
+                    df_comercial_filtrado["Descrição Vendedor"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+            }
+        )
+        .groupby(
+            "Descrição Vendedor",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    df_tipo_produto = (
+        df_comercial_filtrado
+        .groupby(
+            "Tipo Produto",
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            "Quantidade",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    return (
+        df_produtos_ranking,
+        df_corretoras_ranking,
+        df_vendedores_ranking,
+        df_tipo_produto,
+    )
+
+
+
+
+def criar_metas_2026():
+    """
+    Metas comerciais informadas para 2026.
+    Saúde possui a composição Empresarial + Coletivo por Adesão.
+    Odonto possui a meta mensal de vendas novas.
+    """
+    competencias = pd.date_range(
+        start="2026-01-01",
+        end="2026-12-01",
+        freq="MS",
+    )
+
+    meta_saude = pd.DataFrame(
+        {
+            "Competencia": competencias,
+            "Meta Saúde Empresarial": [
+                1928, 1960, 2154, 2335, 2134, 2234,
+                2200, 2477, 2475, 2384, 2646, 2630,
+            ],
+            "Meta Coletivo por Adesão": [
+                134, 154, 163, 167, 165, 171,
+                216, 202, 215, 210, 204, 226,
+            ],
+            "Meta Saúde Total": [
+                2062, 2114, 2317, 2502, 2299, 2405,
+                2416, 2679, 2690, 2594, 2850, 2856,
+            ],
+        }
+    )
+
+    meta_odonto = pd.DataFrame(
+        {
+            "Competencia": competencias,
+            "Meta Odonto": [
+                745, 651, 795, 706, 750, 877,
+                798, 833, 855, 876, 883, 929,
+            ],
+        }
+    )
+
+    return meta_saude, meta_odonto
+
+
+def montar_comparativo_saude(
+    vendido: pd.DataFrame,
+    metas: pd.DataFrame,
+    competencias_selecionadas: list[str],
+) -> pd.DataFrame:
+    competencias_datas = pd.to_datetime(
+        competencias_selecionadas,
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    base_meta = metas[
+        metas["Competencia"].isin(competencias_datas)
+    ].copy()
+
+    real = vendido[
+        ["Competencia", "Descrição Beneficiário"]
+    ].copy()
+
+    real = real.rename(
+        columns={
+            "Descrição Beneficiário": "Vendido",
+        }
+    )
+
+    comparativo = base_meta.merge(
+        real,
+        how="left",
+        on="Competencia",
+    )
+
+    comparativo["Vendido"] = (
+        comparativo["Vendido"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    comparativo["Diferença"] = (
+        comparativo["Vendido"]
+        - comparativo["Meta Saúde Total"]
+    )
+
+    comparativo["Atingimento (%)"] = (
+        comparativo["Vendido"]
+        / comparativo["Meta Saúde Total"]
+        * 100
+    )
+
+    return comparativo.sort_values(
+        "Competencia"
+    ).reset_index(drop=True)
+
+
+def montar_comparativo_odonto(
+    vendido: pd.DataFrame,
+    metas: pd.DataFrame,
+    competencias_selecionadas: list[str],
+) -> pd.DataFrame:
+    competencias_datas = pd.to_datetime(
+        competencias_selecionadas,
+        format="%m/%Y",
+        errors="coerce",
+    )
+
+    base_meta = metas[
+        metas["Competencia"].isin(competencias_datas)
+    ].copy()
+
+    real = vendido[
+        ["Competencia", "Descrição Beneficiário"]
+    ].copy()
+
+    real = real.rename(
+        columns={
+            "Descrição Beneficiário": "Vendido",
+        }
+    )
+
+    comparativo = base_meta.merge(
+        real,
+        how="left",
+        on="Competencia",
+    )
+
+    comparativo["Vendido"] = (
+        comparativo["Vendido"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    comparativo["Diferença"] = (
+        comparativo["Vendido"]
+        - comparativo["Meta Odonto"]
+    )
+
+    comparativo["Atingimento (%)"] = (
+        comparativo["Vendido"]
+        / comparativo["Meta Odonto"]
+        * 100
+    )
+
+    return comparativo.sort_values(
+        "Competencia"
+    ).reset_index(drop=True)
+
+
+def grafico_vendido_meta(
+    comparativo: pd.DataFrame,
+    coluna_meta: str,
+    titulo: str,
+) -> go.Figure:
+    dados = comparativo.copy()
+    dados["Competencia_Label"] = (
+        dados["Competencia"].dt.strftime("%m/%Y")
+    )
+
+    fig = go.Figure()
+
+    fig.add_bar(
+        x=dados["Competencia_Label"],
+        y=dados[coluna_meta],
+        name="Meta",
+        marker_color="#8B908D",
+        text=dados[coluna_meta],
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Meta: %{y:,.0f}<extra></extra>"
+        ),
+    )
+
+    fig.add_bar(
+        x=dados["Competencia_Label"],
+        y=dados["Vendido"],
+        name="Vendido",
+        marker_color="#86BC25",
+        text=dados["Vendido"],
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Vendido: %{y:,.0f}<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        title=titulo,
+        barmode="group",
+        height=470,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            y=1.12,
+            x=1,
+            xanchor="right",
+        ),
+        margin=dict(
+            l=35,
+            r=25,
+            t=80,
+            b=50,
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Competência",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+def percentual_br(valor: float) -> str:
+    return f"{valor:.1f}%".replace(".", ",")
+
+
+
+def grafico_ranking_comercial(
+    dados: pd.DataFrame,
+    coluna_nome: str,
+    titulo: str,
+    top_n: int = 10,
+) -> go.Figure:
+    ranking = (
+        dados.head(top_n)
+        .sort_values("Quantidade", ascending=True)
+        .copy()
+    )
+
+    fig = go.Figure(
+        go.Bar(
+            x=ranking["Quantidade"],
+            y=ranking[coluna_nome],
+            orientation="h",
+            text=ranking["Quantidade"],
+            textposition="outside",
+            marker_color="#86BC25",
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Quantidade: %{x}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title=titulo,
+        height=max(410, 42 * len(ranking) + 120),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        showlegend=False,
+        margin=dict(
+            l=20,
+            r=65,
+            t=70,
+            b=45,
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Quantidade de beneficiários",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    fig.update_yaxes(
+        title=None,
+    )
+
+    return fig
+
+
+def grafico_tipo_produto(
+    dados: pd.DataFrame,
+) -> go.Figure:
+    fig = go.Figure(
+        go.Bar(
+            x=dados["Tipo Produto"],
+            y=dados["Quantidade"],
+            text=dados["Quantidade"],
+            textposition="outside",
+            marker_color="#86BC25",
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Quantidade: %{y}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title=(
+            "Produção por tipo de produto"
+            "<br><sup>AMB = Ambulatorial | ENF/QUA = Completo | ODO = Odonto</sup>"
+        ),
+        height=430,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        showlegend=False,
+        margin=dict(
+            l=35,
+            r=25,
+            t=85,
+            b=50,
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Tipo de produto",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade de beneficiários",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+
+
+def criar_visao_vendedores_internos(
+    base: pd.DataFrame,
+) -> pd.DataFrame:
+    dados = base.copy()
+
+    dados["Vendedor Interno"] = (
+        dados["Descrição Vendedor"]
+        .map(canonizar_vendedor)
+    )
+
+    dados = dados[
+        dados["Vendedor Interno"].notna()
+    ].copy()
+
+    def classificar_segmento(valor):
+        valor = (
+            str(valor).strip().upper()
+            if pd.notna(valor)
+            else ""
+        )
+
+        if valor == "ODO":
+            return "Odonto"
+
+        if valor not in {
+            "ODO",
+            "SEM",
+            "",
+        }:
+            return "Saúde"
+
+        return None
+
+    dados["Segmento"] = (
+        dados["Id Acomodação"]
+        .map(classificar_segmento)
+    )
+
+    dados = dados[
+        dados["Segmento"].notna()
+    ].copy()
+
+    if dados.empty:
+        return pd.DataFrame(
+            columns=[
+                "Competencia_Data",
+                "Competencia",
+                "Vendedor Interno",
+                "Segmento",
+                "Quantidade",
+            ]
+        )
+
+    agrupado = (
+        dados
+        .groupby(
+            [
+                "Competencia_Data",
+                "Competencia",
+                "Vendedor Interno",
+                "Segmento",
+            ],
+            dropna=False,
+        )
+        .agg(
+            {
+                "Descrição Beneficiário": "count",
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "Descrição Beneficiário": "Quantidade",
+            }
+        )
+        .sort_values(
+            [
+                "Competencia_Data",
+                "Vendedor Interno",
+                "Segmento",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    return agrupado
+
+
+def grafico_vendedor_interno(
+    dados: pd.DataFrame,
+    vendedor: str,
+) -> go.Figure:
+    base = dados[
+        dados["Vendedor Interno"].eq(
+            vendedor
+        )
+    ].copy()
+
+    fig = go.Figure()
+
+    if base.empty:
+        fig.update_layout(
+            title=f"{vendedor} — sem vendas no recorte selecionado",
+            height=420,
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        return fig
+
+    competencias = (
+        base[
+            [
+                "Competencia_Data",
+                "Competencia",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            "Competencia_Data"
+        )
+        ["Competencia"]
+        .tolist()
+    )
+
+    for segmento, cor in [
+        (
+            "Saúde",
+            "#86BC25",
+        ),
+        (
+            "Odonto",
+            "#6F7772",
+        ),
+    ]:
+        segmento_df = (
+            base[
+                base["Segmento"].eq(
+                    segmento
+                )
+            ]
+            .set_index(
+                "Competencia"
+            )
+        )
+
+        valores = [
+            int(
+                segmento_df.loc[
+                    competencia,
+                    "Quantidade",
+                ]
+            )
+            if competencia in segmento_df.index
+            else 0
+            for competencia in competencias
+        ]
+
+        fig.add_bar(
+            x=competencias,
+            y=valores,
+            name=segmento,
+            text=valores,
+            textposition="outside",
+            marker_color=cor,
+        )
+
+    fig.update_layout(
+        title=(
+            f"{vendedor}"
+            "<br><sup>Quantidade vendida por competência — Saúde x Odonto</sup>"
+        ),
+        barmode="group",
+        height=470,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(
+            l=35,
+            r=25,
+            t=80,
+            b=55,
+        ),
+        legend=dict(
+            orientation="h",
+            y=1.12,
+            x=1,
+            xanchor="right",
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Competência",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade de beneficiários",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+def grafico_total_vendedores_internos(
+    dados: pd.DataFrame,
+) -> go.Figure:
+    total = (
+        dados
+        .groupby(
+            [
+                "Vendedor Interno",
+                "Segmento",
+            ],
+            dropna=False,
+        )
+        ["Quantidade"]
+        .sum()
+        .reset_index()
+    )
+
+    fig = px.bar(
+        total,
+        x="Vendedor Interno",
+        y="Quantidade",
+        color="Segmento",
+        barmode="group",
+        text="Quantidade",
+        color_discrete_map={
+            "Saúde": "#86BC25",
+            "Odonto": "#6F7772",
+        },
+    )
+
+    fig.update_traces(
+        textposition="outside",
+    )
+
+    fig.update_layout(
+        title=(
+            "Vendedores Internos"
+            "<br><sup>Produção total no recorte selecionado</sup>"
+        ),
+        height=450,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        legend_title=None,
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title=None,
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade de beneficiários",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+def grafico_pipeline_por_vendedor(
+    dados: pd.DataFrame,
+) -> go.Figure:
+    resumo = (
+        dados
+        .groupby(
+            "Vendedor",
+            dropna=False,
+        )
+        ["Vidas"]
+        .sum()
+        .reset_index()
+        .sort_values(
+            "Vidas",
+            ascending=False,
+        )
+    )
+
+    fig = px.bar(
+        resumo,
+        x="Vendedor",
+        y="Vidas",
+        text="Vidas",
+    )
+
+    fig.update_traces(
+        marker_color="#86BC25",
+        textposition="outside",
+    )
+
+    fig.update_layout(
+        title="Vidas prospectadas por vendedor",
+        height=420,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+        xaxis_title=None,
+        yaxis_title="Vidas",
+    )
+
+    return fig
+
+
+def grafico_pipeline_por_status(
+    dados: pd.DataFrame,
+) -> go.Figure:
+    resumo = (
+        dados
+        .assign(
+            **{
+                "Status da Negociação": (
+                    dados[
+                        "Status da Negociação"
+                    ]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace(
+                        "",
+                        "Não informado",
+                    )
+                )
+            }
+        )
+        .groupby(
+            "Status da Negociação",
+            dropna=False,
+        )
+        ["Vidas"]
+        .sum()
+        .reset_index()
+        .sort_values(
+            "Vidas",
+            ascending=False,
+        )
+        .head(15)
+        .sort_values(
+            "Vidas",
+            ascending=True,
+        )
+    )
+
+    fig = px.bar(
+        resumo,
+        x="Vidas",
+        y="Status da Negociação",
+        orientation="h",
+        text="Vidas",
+    )
+
+    fig.update_traces(
+        marker_color="#86BC25",
+        textposition="outside",
+    )
+
+    fig.update_layout(
+        title="Vidas por status da negociação",
+        height=max(
+            430,
+            len(resumo) * 38 + 140,
+        ),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+        xaxis_title="Vidas",
+        yaxis_title=None,
+    )
+
+    return fig
+
+
+
+
+def grafico_producao_evasao_competencia(
+    saldo: pd.DataFrame,
+) -> go.Figure:
+    if saldo.empty:
+        return go.Figure()
+
+    dados = (
+        saldo
+        .groupby(
+            "Competencia",
+            as_index=False,
+        )[
+            [
+                "Quantidade de Producao",
+                "Quantidade de Evasões",
+            ]
+        ]
+        .sum()
+        .sort_values("Competencia")
+    )
+
+    dados["Competencia_Label"] = (
+        dados["Competencia"]
+        .astype(str)
+    )
+
+    fig = go.Figure()
+
+    fig.add_bar(
+        x=dados["Competencia_Label"],
+        y=dados["Quantidade de Producao"],
+        name="Produção",
+        marker_color="#86BC25",
+        text=dados["Quantidade de Producao"],
+        textposition="outside",
+    )
+
+    fig.add_bar(
+        x=dados["Competencia_Label"],
+        y=dados["Quantidade de Evasões"],
+        name="Evasão",
+        marker_color="#D64545",
+        text=dados["Quantidade de Evasões"],
+        textposition="outside",
+    )
+
+    fig.update_layout(
+        title="Produção x Evasão por competência",
+        barmode="group",
+        height=470,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            y=1.12,
+            x=1,
+            xanchor="right",
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Competência",
+        showgrid=False,
+    )
+
+    fig.update_yaxes(
+        title="Quantidade",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    return fig
+
+
+def grafico_saldo_corretoras(
+    saldo: pd.DataFrame,
+    limite: int = 20,
+) -> go.Figure:
+    if saldo.empty:
+        return go.Figure()
+
+    ranking = (
+        saldo
+        .groupby(
+            "Descrição Corretora",
+            as_index=False,
+        )[
+            [
+                "Quantidade de Producao",
+                "Quantidade de Evasões",
+                "Saldo",
+            ]
+        ]
+        .sum()
+        .sort_values(
+            "Saldo",
+            ascending=False,
+        )
+    )
+
+    if len(ranking) > limite:
+        metade = limite // 2
+        ranking = pd.concat(
+            [
+                ranking.head(metade),
+                ranking.tail(limite - metade),
+            ],
+            ignore_index=True,
+        )
+
+    ranking = ranking.sort_values(
+        "Saldo",
+        ascending=True,
+    )
+
+    cores = [
+        "#86BC25"
+        if valor >= 0
+        else "#D64545"
+        for valor in ranking["Saldo"]
+    ]
+
+    fig = go.Figure(
+        go.Bar(
+            x=ranking["Saldo"],
+            y=ranking["Descrição Corretora"],
+            orientation="h",
+            text=ranking["Saldo"],
+            textposition="outside",
+            marker_color=cores,
+            customdata=ranking[
+                [
+                    "Quantidade de Producao",
+                    "Quantidade de Evasões",
+                ]
+            ],
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Produção: %{customdata[0]}<br>"
+                "Evasão: %{customdata[1]}<br>"
+                "Saldo: %{x}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title=(
+            "Saldo por corretora"
+            "<br><sup>Verde = saldo positivo | Vermelho = saldo negativo</sup>"
+        ),
+        height=max(
+            500,
+            len(ranking) * 32 + 160,
+        ),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        showlegend=False,
+        margin=dict(
+            l=20,
+            r=70,
+            t=85,
+            b=45,
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Saldo (Produção - Evasão)",
+        gridcolor="#E8EDE4",
+        zeroline=True,
+        zerolinecolor="#6B736D",
+    )
+
+    fig.update_yaxes(
+        title=None,
+    )
+
+    return fig
+
+
+def grafico_motivos_evasao(
+    motivos: pd.DataFrame,
+    limite: int = 15,
+) -> go.Figure:
+    if motivos.empty:
+        return go.Figure()
+
+    ranking = (
+        motivos
+        .groupby(
+            "Descrição Cancelamento",
+            as_index=False,
+        )["Quantidade de Evasões"]
+        .sum()
+        .sort_values(
+            "Quantidade de Evasões",
+            ascending=False,
+        )
+        .head(limite)
+        .sort_values(
+            "Quantidade de Evasões",
+            ascending=True,
+        )
+    )
+
+    fig = go.Figure(
+        go.Bar(
+            x=ranking["Quantidade de Evasões"],
+            y=ranking["Descrição Cancelamento"],
+            orientation="h",
+            text=ranking["Quantidade de Evasões"],
+            textposition="outside",
+            marker_color="#D64545",
+        )
+    )
+
+    fig.update_layout(
+        title="Principais motivos de evasão",
+        height=max(
+            430,
+            len(ranking) * 34 + 140,
+        ),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        showlegend=False,
+        margin=dict(
+            l=20,
+            r=65,
+            t=70,
+            b=45,
+        ),
+        font=dict(
+            family="Arial",
+            color="#404640",
+        ),
+    )
+
+    fig.update_xaxes(
+        title="Quantidade de evasões",
+        gridcolor="#E8EDE4",
+        zeroline=False,
+    )
+
+    fig.update_yaxes(
+        title=None,
+    )
+
+    return fig
+
+
+
+def tabela_formatada_competencia(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    resultado = df.copy()
+
+    if "Competencia" in resultado.columns:
+        resultado["Competencia"] = (
+            resultado["Competencia"]
+            .dt.strftime("%m/%Y")
+        )
+
+    return resultado
+
+
+# =========================================================
+# CABEÇALHO
+# =========================================================
+col_logo, col_titulo = st.columns(
+    [0.9, 4.1],
+    vertical_alignment="center",
+)
+
+with col_logo:
+    if LOGO_PATH.exists():
+        st.image(
+            str(LOGO_PATH),
+            width=190,
+        )
+
+with col_titulo:
+    st.markdown(
+        """
+        <div class="titulo-mediatorie">
+            Dashboard Comercial
+        </div>
+        <div class="subtitulo-mediatorie">
+            Mediatorie Administradora de Benefícios
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.caption(
+    "O painel reproduz as regras e os agrupamentos do processo já validado em Pandas."
+)
+
+
+# =========================================================
+# UPLOAD
+# =========================================================
+with st.sidebar:
+    st.header("Bases")
+
+    arquivo_base = st.file_uploader(
+        "1. Base Total",
+        type=["xlsx", "xls"],
+        key="upload_base_total",
+        help="Ex.: Itens - 2026-09-17T133257.920.xlsx",
+    )
+
+    arquivo_carteira = st.file_uploader(
+        "2. Carteira de Executivos",
+        type=["xlsx", "xls"],
+        key="upload_carteira",
+        help="Ex.: 2026.09 - atualizado em 15.09.xlsx",
+    )
+
+    st.divider()
+
+    st.markdown("#### Regras fixas")
+    st.caption("Movimentação: VIDA NOVA")
+    st.caption(
+        "Cancelamento aceito: SEM JUSTA CAUSA, JUSTA CAUSA, "
+        "A PEDIDO DO BENEFICIÁRIO (RN561), "
+        "BENEFÍCIO DEMITIDO/APOSENTADO (RN279), "
+        "DESLIGAMENTO DA EMPRESA (RN279), INADIMPLENTE ou vazio."
+        "ATEN ADM - CANCELAMENTO DE CONTRATO, "
+        "RECISÃO POR ACORDO, "
+        "ÓBITO, "
+        "INADIMPLENTE, "
+        "DESISTÊNCIA, "
+
+
+    )
+    st.caption("Registros válidos: Diferença ≤ 0")
+    st.caption("Competências disponíveis: 01/2026 em diante")
+
+
+if arquivo_base is None or arquivo_carteira is None:
+    st.info(
+        "Envie as duas planilhas no menu lateral para gerar o dashboard."
+    )
+    st.stop()
+
+
+# =========================================================
+# EXECUÇÃO DO PROCESSO
+# =========================================================
+try:
+    with st.spinner(
+        "Processando Base Total e Carteira de Executivos..."
+    ):
+        (
+            df_merge_filtrado,
+            df_certo,
+            df_nao_corretos,
+            df_saude,
+            df_odonto,
+            df_saude_exec,
+            df_odonto_exec,
+            df_saude_comp,
+            df_odonto_comp,
+            df_comercial,
+            df_produtos_ranking,
+            df_corretoras_ranking,
+            df_vendedores_ranking,
+            df_tipo_produto,
+        ) = processar_bases(
+            arquivo_base.name,
+            arquivo_base.getvalue(),
+            arquivo_carteira.name,
+            arquivo_carteira.getvalue(),
+        )
+
+except Exception as erro:
+    st.error(
+        f"Não foi possível processar as bases: {erro}"
+    )
+    st.stop()
+
+
+# =========================================================
+# BASE DE EVASÃO
+# A produção será montada depois dos filtros centrais, usando o
+# mesmo realizado dos KPIs Saúde + Odonto.
+# =========================================================
+try:
+    df_evasao_base = preparar_base_evasao(
+        arquivo_base.name,
+        arquivo_base.getvalue(),
+    )
+
+except Exception as erro:
+    st.error(
+        f"Não foi possível preparar a base de evasão: {erro}"
+    )
+    st.stop()
+
+
+# =========================================================
+# FILTROS GLOBAIS
+# =========================================================
+competencias_disponiveis = (
+    df_comercial[
+        ["Competencia_Data", "Competencia"]
+    ]
+    .dropna(subset=["Competencia_Data"])
+    .drop_duplicates()
+    .sort_values("Competencia_Data")
+    ["Competencia"]
+    .tolist()
+)
+
+with st.sidebar:
+    st.divider()
+    st.markdown("### Filtros")
+
+    competencias_selecionadas = st.multiselect(
+        "Competência",
+        options=competencias_disponiveis,
+        default=competencias_disponiveis,
+        help="Selecione um ou mais meses.",
+    )
+
+if not competencias_selecionadas:
+    st.warning(
+        "Selecione pelo menos uma competência para exibir o dashboard."
+    )
+    st.stop()
+
+# Primeiro aplica competência para montar as opções comerciais.
+df_filtros = df_comercial[
+    df_comercial["Competencia"].isin(
+        competencias_selecionadas
+    )
+].copy()
+
+with st.sidebar:
+    materiais_disponiveis = sorted(
+        df_filtros["Descrição Material"]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+        .unique()
+        .tolist()
+    )
+
+    materiais_selecionados = st.multiselect(
+        "Material",
+        options=materiais_disponiveis,
+        default=materiais_disponiveis,
+    )
+
+    corretoras_disponiveis = sorted(
+        df_filtros["Descrição Corretora"]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+        .unique()
+        .tolist()
+    )
+
+    corretoras_selecionadas = st.multiselect(
+        "Corretora",
+        options=corretoras_disponiveis,
+        default=corretoras_disponiveis,
+    )
+
+    vendedores_disponiveis = sorted(
+        df_filtros["Descrição Vendedor"]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+        .unique()
+        .tolist()
+    )
+
+    vendedores_selecionados = st.multiselect(
+        "Vendedor",
+        options=vendedores_disponiveis,
+        default=vendedores_disponiveis,
+    )
+
+    st.caption(
+        "Os filtros afetam KPIs, Saúde, Odonto, executivos, "
+        "rankings, metas e Produção x Evasão por Corretora."
+    )
+
+# Padroniza os campos antes de aplicar os filtros.
+for coluna in [
+    "Descrição Material",
+    "Descrição Corretora",
+    "Descrição Vendedor",
+]:
+    df_filtros[coluna] = (
+        df_filtros[coluna]
+        .astype("string")
+        .fillna("Não informado")
+        .str.strip()
+        .replace("", "Não informado")
+    )
+
+df_comercial_base_internos = df_filtros[
+    df_filtros["Descrição Material"].isin(
+        materiais_selecionados
+    )
+    & df_filtros["Descrição Corretora"].isin(
+        corretoras_selecionadas
+    )
+].copy()
+
+df_comercial = df_comercial_base_internos[
+    df_comercial_base_internos["Descrição Vendedor"].isin(
+        vendedores_selecionados
+    )
+].copy()
+
+if df_comercial.empty:
+    st.warning(
+        "Nenhum registro corresponde aos filtros selecionados."
+    )
+    st.stop()
+
+# Recalcula todas as visões com a base filtrada.
+(
+    df_saude_exec,
+    df_odonto_exec,
+    df_saude_comp,
+    df_odonto_comp,
+    df_produtos_ranking,
+    df_corretoras_ranking,
+    df_vendedores_ranking,
+    df_entidades_ranking,
+    df_tipo_produto,
+) = recalcular_visoes_filtradas(
+    df_comercial
+)
+
+df_vendedores_internos = criar_visao_vendedores_internos(
+    df_comercial_base_internos
+)
+
+
+# =========================================================
+# PRODUÇÃO X EVASÃO - MESMOS FILTROS CENTRAIS
+# =========================================================
+(
+    saldo_corretoras,
+    evasao_corretora_motivos,
+    df_producao_corretoras,
+    df_evasao_corretoras,
+) = montar_producao_evasao(
+    df_comercial_filtrado=df_comercial,
+    df_evasao_base=df_evasao_base,
+    competencias_selecionadas=competencias_selecionadas,
+    materiais_selecionados=materiais_selecionados,
+    corretoras_selecionadas=corretoras_selecionadas,
+    vendedores_selecionados=vendedores_selecionados,
+)
+
+
+# =========================================================
+# METAS X VENDIDO
+# =========================================================
+meta_saude_2026, meta_odonto_2026 = criar_metas_2026()
+
+comparativo_saude = montar_comparativo_saude(
+    df_saude_comp,
+    meta_saude_2026,
+    competencias_selecionadas,
+)
+
+comparativo_odonto = montar_comparativo_odonto(
+    df_odonto_comp,
+    meta_odonto_2026,
+    competencias_selecionadas,
+)
+
+
+# =========================================================
+# DIAGNÓSTICO DO MERGE
+# =========================================================
+sem_executivo = int(
+    df_merge_filtrado["NOME"].isna().sum()
+)
+
+if sem_executivo:
+    st.warning(
+        f"{sem_executivo:,}".replace(",", ".")
+        + " registro(s) ficaram sem NOME após o merge "
+        "entre Id Corretora e ID Parceiro."
+    )
+
+
+st.caption(
+    "**Competência selecionada:** "
+    + ", ".join(competencias_selecionadas)
+    + f"  |  **Materiais:** {len(materiais_selecionados)}"
+    + f"  |  **Corretoras:** {len(corretoras_selecionadas)}"
+    + f"  |  **Vendedores:** {len(vendedores_selecionados)}"
+)
+
+# =========================================================
+# KPIs
+# Os totais abaixo são obtidos dos mesmos agrupamentos
+# que alimentam os gráficos.
+# =========================================================
+total_saude = int(
+    df_saude_comp["Descrição Beneficiário"].sum()
+) if not df_saude_comp.empty else 0
+
+total_odonto = int(
+    df_odonto_comp["Descrição Beneficiário"].sum()
+) if not df_odonto_comp.empty else 0
+
+total_validos = total_saude + total_odonto
+total_nao_corretos = len(df_nao_corretos)
+
+k1, k2, k3, k4 = st.columns(4)
+
+k1.metric(
+    "Saúde | 01/2026+",
+    f"{total_saude:,}".replace(",", "."),
+)
+
+k2.metric(
+    "Odonto | 01/2026+",
+    f"{total_odonto:,}".replace(",", "."),
+)
+
+k3.metric(
+    "Saúde + Odonto",
+    f"{total_validos:,}".replace(",", "."),
+)
+
+k4.metric(
+    "Diferença > 0",
+    f"{total_nao_corretos:,}".replace(",", "."),
+)
+
+
+# =========================================================
+# RELATÓRIO GERENCIAL EM PDF
+# =========================================================
+with st.sidebar:
+    st.divider()
+    st.markdown("### Relatório gerencial")
+
+    st.caption(
+        "Gera um PDF com o recorte atual do Dashboard Comercial, "
+        "incluindo metas, executivos, vendedores internos, previsão de vendas e rankings."
+    )
+
+    if st.button(
+        "Gerar relatório PDF",
+        use_container_width=True,
+        type="primary",
+    ):
+        with st.spinner("Montando relatório comercial..."):
+            pipeline_pdf = preparar_pipeline(
+                st.session_state.get(
+                    "pipeline_vendas_internas",
+                    pd.DataFrame(columns=COLUNAS_PIPELINE),
+                )
+            )
+
+            if not pipeline_pdf.empty:
+                pipeline_pdf["Status da Negociação"] = (
+                    pipeline_pdf["Status da Negociação"]
+                    .astype("string")
+                    .fillna("Não informado")
+                    .str.strip()
+                    .replace("", "Não informado")
+                )
+
+                vendedores_pipeline_pdf = st.session_state.get(
+                    "filtro_pipeline_vendedor",
+                    VENDEDORES_INTERNOS,
+                )
+
+                status_disponiveis_pdf = sorted(
+                    pipeline_pdf["Status da Negociação"]
+                    .unique()
+                    .tolist()
+                )
+
+                status_pipeline_pdf = st.session_state.get(
+                    "filtro_pipeline_status",
+                    status_disponiveis_pdf,
+                )
+
+                pipeline_pdf = pipeline_pdf[
+                    pipeline_pdf["Vendedor"].isin(
+                        vendedores_pipeline_pdf
+                    )
+                    & pipeline_pdf["Status da Negociação"].isin(
+                        status_pipeline_pdf
+                    )
+                ].copy()
+
+            st.session_state["relatorio_comercial_pdf"] = (
+                gerar_relatorio_comercial_pdf(
+                    logo_path=LOGO_PATH,
+                    origem_base=arquivo_base.name,
+                    origem_carteira=arquivo_carteira.name,
+                    filtros={
+                        "competencias": competencias_selecionadas,
+                        "materiais": materiais_selecionados,
+                        "corretoras": corretoras_selecionadas,
+                        "vendedores": vendedores_selecionados,
+                        "total_competencias": len(competencias_disponiveis),
+                        "total_materiais": len(materiais_disponiveis),
+                        "total_corretoras": len(corretoras_disponiveis),
+                        "total_vendedores": len(vendedores_disponiveis),
+                    },
+                    totais={
+                        "saude": total_saude,
+                        "odonto": total_odonto,
+                        "total": total_validos,
+                        "nao_corretos": total_nao_corretos,
+                    },
+                    df_saude_comp=df_saude_comp,
+                    df_odonto_comp=df_odonto_comp,
+                    comparativo_saude=comparativo_saude,
+                    comparativo_odonto=comparativo_odonto,
+                    df_saude_exec=df_saude_exec,
+                    df_odonto_exec=df_odonto_exec,
+                    df_produtos_ranking=df_produtos_ranking,
+                    df_corretoras_ranking=df_corretoras_ranking,
+                    df_vendedores_ranking=df_vendedores_ranking,
+                    df_entidades_ranking=df_entidades_ranking,
+                    df_tipo_produto=df_tipo_produto,
+                    df_vendedores_internos=df_vendedores_internos,
+                    df_pipeline_vendas=pipeline_pdf,
+                )
+            )
+
+    if "relatorio_comercial_pdf" in st.session_state:
+        st.download_button(
+            "Baixar relatório PDF",
+            data=st.session_state["relatorio_comercial_pdf"],
+            file_name="relatorio_gerencial_comercial_mediatorie.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+
+# =========================================================
+# DASHBOARD
+# =========================================================
+(
+    aba_geral,
+    aba_metas,
+    aba_executivos,
+    aba_vendedores_internos,
+    aba_previsao_vendas,
+    aba_saude,
+    aba_odonto,
+    aba_rankings,
+    aba_producao_evasao,
+    aba_conferencia,
+) = st.tabs(
+    [
+        "Visão Geral",
+        "Metas",
+        "Executivos",
+        "Vendedores Internos",
+        "Previsão de Vendas",
+        "Saúde",
+        "Odonto",
+        "Rankings Comerciais",
+        "Produção x Evasão",
+        "Conferência",
+    ]
+)
+
+
+# ---------------------------------------------------------
+# VISÃO GERAL
+# ---------------------------------------------------------
+with aba_geral:
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if df_saude_comp.empty:
+            st.info(
+                "Sem dados de Saúde para as competências válidas."
+            )
+        else:
+            st.plotly_chart(
+                grafico_total_competencia(
+                    df_saude_comp,
+                    "Saúde por competência",
+                ),
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                },
+            )
+
+    with c2:
+        if df_odonto_comp.empty:
+            st.info(
+                "Sem dados de Odonto para as competências válidas."
+            )
+        else:
+            st.plotly_chart(
+                grafico_total_competencia(
+                    df_odonto_comp,
+                    "Odonto por competência",
+                ),
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                },
+            )
+
+
+# ---------------------------------------------------------
+# METAS
+# ---------------------------------------------------------
+with aba_metas:
+    st.subheader("Vendido x Meta")
+
+    st.caption(
+        "O realizado utiliza exatamente os mesmos agrupamentos homologados "
+        "do dashboard. A meta é comparada somente às competências selecionadas."
+    )
+
+    # -----------------------------------------------------
+    # KPIs Saúde
+    # -----------------------------------------------------
+    vendido_saude_meta = int(
+        comparativo_saude["Vendido"].sum()
+    ) if not comparativo_saude.empty else 0
+
+    meta_saude_total = int(
+        comparativo_saude["Meta Saúde Total"].sum()
+    ) if not comparativo_saude.empty else 0
+
+    ating_saude = (
+        vendido_saude_meta / meta_saude_total * 100
+        if meta_saude_total
+        else 0
+    )
+
+    diferenca_saude = (
+        vendido_saude_meta - meta_saude_total
+    )
+
+    # -----------------------------------------------------
+    # KPIs Odonto
+    # -----------------------------------------------------
+    vendido_odonto_meta = int(
+        comparativo_odonto["Vendido"].sum()
+    ) if not comparativo_odonto.empty else 0
+
+    meta_odonto_total = int(
+        comparativo_odonto["Meta Odonto"].sum()
+    ) if not comparativo_odonto.empty else 0
+
+    ating_odonto = (
+        vendido_odonto_meta / meta_odonto_total * 100
+        if meta_odonto_total
+        else 0
+    )
+
+    diferenca_odonto = (
+        vendido_odonto_meta - meta_odonto_total
+    )
+
+    st.markdown("#### Saúde")
+
+    s1, s2, s3, s4 = st.columns(4)
+
+    s1.metric(
+        "Vendido",
+        f"{vendido_saude_meta:,}".replace(",", "."),
+    )
+
+    s2.metric(
+        "Meta",
+        f"{meta_saude_total:,}".replace(",", "."),
+    )
+
+    s3.metric(
+        "Atingimento",
+        percentual_br(ating_saude),
+    )
+
+    s4.metric(
+        "Diferença",
+        f"{diferenca_saude:+,}".replace(",", "."),
+    )
+
+    if not comparativo_saude.empty:
+        st.plotly_chart(
+            grafico_vendido_meta(
+                comparativo_saude,
+                "Meta Saúde Total",
+                "Saúde — Vendido x Meta Total",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+        tabela_saude_meta = comparativo_saude.copy()
+        tabela_saude_meta["Competencia"] = (
+            tabela_saude_meta["Competencia"]
+            .dt.strftime("%m/%Y")
+        )
+
+        st.dataframe(
+            tabela_saude_meta,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Atingimento (%)": st.column_config.NumberColumn(
+                    format="%.1f%%"
+                ),
+            },
+        )
+
+    st.divider()
+    st.markdown("#### Odonto")
+
+    o1, o2, o3, o4 = st.columns(4)
+
+    o1.metric(
+        "Vendido",
+        f"{vendido_odonto_meta:,}".replace(",", "."),
+    )
+
+    o2.metric(
+        "Meta",
+        f"{meta_odonto_total:,}".replace(",", "."),
+    )
+
+    o3.metric(
+        "Atingimento",
+        percentual_br(ating_odonto),
+    )
+
+    o4.metric(
+        "Diferença",
+        f"{diferenca_odonto:+,}".replace(",", "."),
+    )
+
+    if not comparativo_odonto.empty:
+        st.plotly_chart(
+            grafico_vendido_meta(
+                comparativo_odonto,
+                "Meta Odonto",
+                "Odonto — Vendido x Meta",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+        tabela_odonto_meta = comparativo_odonto.copy()
+        tabela_odonto_meta["Competencia"] = (
+            tabela_odonto_meta["Competencia"]
+            .dt.strftime("%m/%Y")
+        )
+
+        st.dataframe(
+            tabela_odonto_meta,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Atingimento (%)": st.column_config.NumberColumn(
+                    format="%.1f%%"
+                ),
+            },
+        )
+
+
+# ---------------------------------------------------------
+# EXECUTIVOS
+# ---------------------------------------------------------
+with aba_executivos:
+    st.subheader("Produção por Executivo")
+
+    st.caption(
+        "Os gráficos abaixo utilizam os mesmos agrupamentos homologados "
+        "e respeitam os filtros globais do Dashboard Comercial."
+    )
+
+    st.markdown("#### Saúde")
+
+    if df_saude_exec.empty:
+        st.info(
+            "Não existem registros de Saúde para o período selecionado."
+        )
+    else:
+        st.plotly_chart(
+            grafico_por_executivo(
+                df_saude_exec,
+                "Saúde por competência e executivo",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+            key="executivos_saude_vertical",
+        )
+
+    st.divider()
+
+    st.markdown("#### Odonto")
+
+    if df_odonto_exec.empty:
+        st.info(
+            "Não existem registros de Odonto para o período selecionado."
+        )
+    else:
+        st.plotly_chart(
+            grafico_por_executivo(
+                df_odonto_exec,
+                "Odonto por competência e executivo",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+            key="executivos_odonto_vertical",
+        )
+
+
+# ---------------------------------------------------------
+# VENDEDORES INTERNOS
+# ---------------------------------------------------------
+with aba_vendedores_internos:
+    st.subheader("Vendedores Internos")
+
+    st.caption(
+        "Esta visão utiliza as mesmas regras homologadas do Dashboard Comercial "
+        "e respeita os filtros de Competência, Material e Corretora. "
+        "O filtro global de Vendedor é ignorado aqui para manter os três vendedores internos visíveis."
+    )
+
+    if df_vendedores_internos.empty:
+        st.info(
+            "Não foram encontradas vendas dos vendedores internos no recorte selecionado."
+        )
+    else:
+        st.plotly_chart(
+            grafico_total_vendedores_internos(
+                df_vendedores_internos
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    tabs_vendedores = st.tabs(
+        VENDEDORES_INTERNOS
+    )
+
+    for vendedor, aba_vendedor in zip(
+        VENDEDORES_INTERNOS,
+        tabs_vendedores,
+    ):
+        with aba_vendedor:
+            base_vendedor = df_vendedores_internos[
+                df_vendedores_internos[
+                    "Vendedor Interno"
+                ].eq(vendedor)
+            ].copy()
+
+            total_saude_vendedor = int(
+                base_vendedor.loc[
+                    base_vendedor["Segmento"].eq("Saúde"),
+                    "Quantidade",
+                ].sum()
+            )
+
+            total_odonto_vendedor = int(
+                base_vendedor.loc[
+                    base_vendedor["Segmento"].eq("Odonto"),
+                    "Quantidade",
+                ].sum()
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Saúde",
+                f"{total_saude_vendedor:,}".replace(",", "."),
+            )
+
+            c2.metric(
+                "Odonto",
+                f"{total_odonto_vendedor:,}".replace(",", "."),
+            )
+
+            c3.metric(
+                "Total",
+                f"{total_saude_vendedor + total_odonto_vendedor:,}".replace(",", "."),
+            )
+
+            st.plotly_chart(
+                grafico_vendedor_interno(
+                    df_vendedores_internos,
+                    vendedor,
+                ),
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                },
+            )
+
+            if not base_vendedor.empty:
+                tabela_vendedor = (
+                    base_vendedor[
+                        [
+                            "Competencia",
+                            "Segmento",
+                            "Quantidade",
+                        ]
+                    ]
+                    .copy()
+                    .sort_values(
+                        [
+                            "Competencia",
+                            "Segmento",
+                        ]
+                    )
+                )
+
+                st.dataframe(
+                    tabela_vendedor,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
+# ---------------------------------------------------------
+# PREVISÃO DE VENDAS / PIPELINE DOS CONSULTORES INTERNOS
+# ---------------------------------------------------------
+with aba_previsao_vendas:
+    st.subheader("Previsão de Vendas — Consultores Internos")
+
+    st.caption(
+        "A importação aceita o mesmo formato da planilha de reunião semanal enviada "
+        "e também o formato plano exportado pelo próprio dashboard."
+    )
+
+    arquivo_pipeline = st.file_uploader(
+        "Subir planilha de previsão de vendas",
+        type=[
+            "xlsx",
+            "xls",
+        ],
+        key="upload_pipeline_interno",
+    )
+
+    if (
+        "pipeline_vendas_internas"
+        not in st.session_state
+    ):
+        st.session_state[
+            "pipeline_vendas_internas"
+        ] = pd.DataFrame(
+            columns=COLUNAS_PIPELINE
+        )
+
+    if arquivo_pipeline is not None:
+        conteudo_pipeline = (
+            arquivo_pipeline.getvalue()
+        )
+
+        assinatura_pipeline = hashlib.sha256(
+            conteudo_pipeline
+        ).hexdigest()
+
+        if (
+            st.session_state.get(
+                "pipeline_upload_assinatura"
+            )
+            != assinatura_pipeline
+        ):
+            try:
+                pipeline_importado = (
+                    carregar_pipeline_excel(
+                        arquivo_pipeline.name,
+                        conteudo_pipeline,
+                    )
+                )
+
+                st.session_state[
+                    "pipeline_vendas_internas"
+                ] = pipeline_importado
+
+                st.session_state[
+                    "pipeline_upload_assinatura"
+                ] = assinatura_pipeline
+
+                st.session_state.pop(
+                    "editor_pipeline_vendas_internas",
+                    None,
+                )
+
+                st.success(
+                    f"{len(pipeline_importado)} registro(s) importado(s) da previsão de vendas."
+                )
+
+            except Exception as erro:
+                st.error(
+                    f"Não foi possível ler a planilha de previsão: {erro}"
+                )
+
+    pipeline_atual = preparar_pipeline(
+        st.session_state[
+            "pipeline_vendas_internas"
+        ]
+    )
+
+    st.session_state[
+        "pipeline_vendas_internas"
+    ] = pipeline_atual
+
+    sub_acompanhamento, sub_cadastro = st.tabs(
+        [
+            "Acompanhamento",
+            "Cadastro e edição",
+        ]
+    )
+
+    with sub_acompanhamento:
+        if pipeline_atual.empty:
+            st.info(
+                "Suba a planilha de previsão ou inclua um novo registro na aba Cadastro e edição."
+            )
+
+        else:
+            vendedores_pipeline = st.multiselect(
+                "Vendedores",
+                options=VENDEDORES_INTERNOS,
+                default=VENDEDORES_INTERNOS,
+                key="filtro_pipeline_vendedor",
+            )
+
+            status_disponiveis = sorted(
+                pipeline_atual[
+                    "Status da Negociação"
+                ]
+                .astype("string")
+                .fillna("Não informado")
+                .str.strip()
+                .replace(
+                    "",
+                    "Não informado",
+                )
+                .unique()
+                .tolist()
+            )
+
+            status_pipeline = st.multiselect(
+                "Status da negociação",
+                options=status_disponiveis,
+                default=status_disponiveis,
+                key="filtro_pipeline_status",
+            )
+
+            pipeline_view = pipeline_atual.copy()
+
+            pipeline_view[
+                "Status da Negociação"
+            ] = (
+                pipeline_view[
+                    "Status da Negociação"
+                ]
+                .astype("string")
+                .fillna("Não informado")
+                .str.strip()
+                .replace(
+                    "",
+                    "Não informado",
+                )
+            )
+
+            pipeline_view = pipeline_view[
+                pipeline_view["Vendedor"].isin(
+                    vendedores_pipeline
+                )
+                & pipeline_view[
+                    "Status da Negociação"
+                ].isin(
+                    status_pipeline
+                )
+            ].copy()
+
+            total_registros = len(
+                pipeline_view
+            )
+
+            total_vidas_pipeline = int(
+                pd.to_numeric(
+                    pipeline_view["Vidas"],
+                    errors="coerce",
+                )
+                .fillna(0)
+                .sum()
+            )
+
+            total_vendedores_pipeline = int(
+                pipeline_view[
+                    "Vendedor"
+                ].nunique()
+            )
+
+            total_status_pipeline = int(
+                pipeline_view[
+                    "Status da Negociação"
+                ].nunique()
+            )
+
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "Oportunidades",
+                f"{total_registros:,}".replace(",", "."),
+            )
+
+            p2.metric(
+                "Vidas prospectadas",
+                f"{total_vidas_pipeline:,}".replace(",", "."),
+            )
+
+            p3.metric(
+                "Vendedores",
+                total_vendedores_pipeline,
+            )
+
+            p4.metric(
+                "Status distintos",
+                total_status_pipeline,
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.plotly_chart(
+                    grafico_pipeline_por_vendedor(
+                        pipeline_view
+                    ),
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                    },
+                )
+
+            with col2:
+                st.plotly_chart(
+                    grafico_pipeline_por_status(
+                        pipeline_view
+                    ),
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                    },
+                )
+
+            st.dataframe(
+                pipeline_view,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with sub_cadastro:
+        st.markdown("#### Incluir novo registro")
+
+        with st.form(
+            "form_novo_registro_pipeline",
+            clear_on_submit=True,
+        ):
+            f1, f2 = st.columns(2)
+
+            with f1:
+                novo_vendedor = st.selectbox(
+                    "Vendedor",
+                    VENDEDORES_INTERNOS,
+                )
+
+                nova_empresa = st.text_input(
+                    "Empresa"
+                )
+
+                novo_plano_saude = st.text_input(
+                    "Plano de Saúde"
+                )
+
+                novo_plano_odonto = st.text_input(
+                    "Plano Odonto"
+                )
+
+            with f2:
+                novo_contato = st.text_input(
+                    "Pessoa de Contato"
+                )
+
+                nova_data_base = st.text_input(
+                    "Data Base",
+                    help="Ex.: NOVEMBRO, MAIO ou outra referência usada pela equipe.",
+                )
+
+                novo_status = st.text_input(
+                    "Status da Negociação"
+                )
+
+                novas_vidas = st.number_input(
+                    "Vidas",
+                    min_value=0,
+                    step=1,
+                    value=0,
+                )
+
+            incluir_registro = st.form_submit_button(
+                "Incluir registro",
+                use_container_width=True,
+            )
+
+        if incluir_registro:
+            if not nova_empresa.strip():
+                st.error(
+                    "Informe a empresa para incluir o registro."
+                )
+            else:
+                novo_registro = pd.DataFrame(
+                    [
+                        {
+                            "Vendedor": novo_vendedor,
+                            "Empresa": nova_empresa,
+                            "Plano de Saúde": novo_plano_saude,
+                            "Plano Odonto": novo_plano_odonto,
+                            "Pessoa de Contato": novo_contato,
+                            "Data Base": nova_data_base,
+                            "Status da Negociação": novo_status,
+                            "Vidas": int(novas_vidas),
+                        }
+                    ]
+                )
+
+                atualizado = pd.concat(
+                    [
+                        pipeline_atual,
+                        novo_registro,
+                    ],
+                    ignore_index=True,
+                )
+
+                st.session_state[
+                    "pipeline_vendas_internas"
+                ] = preparar_pipeline(
+                    atualizado
+                )
+
+                st.session_state.pop(
+                    "editor_pipeline_vendas_internas",
+                    None,
+                )
+
+                st.success(
+                    "Registro incluído."
+                )
+
+                st.rerun()
+
+        st.markdown("#### Editar registros")
+
+        st.caption(
+            "Você pode alterar vendedor, empresa, planos, contato, status e vidas diretamente na tabela. "
+            "Também é possível adicionar ou excluir linhas."
+        )
+
+        editado = st.data_editor(
+            pipeline_atual,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key="editor_pipeline_vendas_internas",
+            column_config={
+                "Vendedor": st.column_config.SelectboxColumn(
+                    "Vendedor",
+                    options=VENDEDORES_INTERNOS,
+                    required=True,
+                ),
+                "Vidas": st.column_config.NumberColumn(
+                    "Vidas",
+                    min_value=0,
+                    step=1,
+                    format="%d",
+                ),
+            },
+        )
+
+        editado_limpo = preparar_pipeline(
+            editado
+        )
+
+        if not editado_limpo.equals(
+            pipeline_atual
+        ):
+            st.session_state[
+                "pipeline_vendas_internas"
+            ] = editado_limpo
+
+        arquivo_pipeline_atualizado = (
+            exportar_pipeline_excel(
+                st.session_state[
+                    "pipeline_vendas_internas"
+                ]
+            )
+        )
+
+        st.download_button(
+            "Baixar pipeline atualizado",
+            data=arquivo_pipeline_atualizado,
+            file_name="pipeline_vendedores_internos.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True,
+        )
+
+        st.info(
+            "Os registros incluídos ou alterados ficam na sessão atual do Streamlit. "
+            "Use o botão acima para salvar a versão atualizada. "
+            "Para persistência compartilhada entre usuários e reinicializações, "
+            "o próximo passo é conectar esta base a uma planilha online ou banco de dados."
+        )
+
+
+# ---------------------------------------------------------
+# SAÚDE
+# ---------------------------------------------------------
+with aba_saude:
+    st.subheader("Saúde")
+
+    st.caption(
+        "Regra: Id Acomodação diferente de ODO e SEM."
+    )
+
+    if df_saude_exec.empty:
+        st.info(
+            "Não existem registros de Saúde para o período."
+        )
+    else:
+        st.plotly_chart(
+            grafico_por_executivo(
+                df_saude_exec,
+                "Saúde por competência e executivo",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    with st.expander(
+        "Ver agrupamento Saúde por executivo"
+    ):
+        st.dataframe(
+            tabela_formatada_competencia(
+                df_saude_exec
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander(
+        "Ver agrupamento Saúde por competência"
+    ):
+        st.dataframe(
+            tabela_formatada_competencia(
+                df_saude_comp
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ---------------------------------------------------------
+# ODONTO
+# ---------------------------------------------------------
+with aba_odonto:
+    st.subheader("Odonto")
+
+    st.caption(
+        "Regra: Id Acomodação igual a ODO."
+    )
+
+    if df_odonto_exec.empty:
+        st.info(
+            "Não existem registros de Odonto para o período."
+        )
+    else:
+        st.plotly_chart(
+            grafico_por_executivo(
+                df_odonto_exec,
+                "Odonto por competência e executivo",
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    with st.expander(
+        "Ver agrupamento Odonto por executivo"
+    ):
+        st.dataframe(
+            tabela_formatada_competencia(
+                df_odonto_exec
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander(
+        "Ver agrupamento Odonto por competência"
+    ):
+        st.dataframe(
+            tabela_formatada_competencia(
+                df_odonto_comp
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ---------------------------------------------------------
+# RANKINGS COMERCIAIS
+# ---------------------------------------------------------
+with aba_rankings:
+    st.subheader("Rankings Comerciais")
+
+    st.caption(
+        "Todos os rankings abaixo utilizam a mesma base válida do processo: "
+        "VIDA NOVA, regra de cancelamento homologada, Diferença ≤ 0 "
+        "e os filtros selecionados no menu lateral."
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.plotly_chart(
+            grafico_ranking_comercial(
+                df_produtos_ranking,
+                "Descrição Material",
+                "Produtos mais vendidos",
+                top_n=10,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    with c2:
+        st.plotly_chart(
+            grafico_ranking_comercial(
+                df_corretoras_ranking,
+                "Descrição Corretora",
+                "Maiores corretoras",
+                top_n=10,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.plotly_chart(
+            grafico_ranking_comercial(
+                df_vendedores_ranking,
+                "Descrição Vendedor",
+                "Maiores vendedores",
+                top_n=10,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    with c4:
+        st.plotly_chart(
+            grafico_ranking_comercial(
+                df_entidades_ranking,
+                "Descrição Entidade",
+                "Ranking por entidade",
+                top_n=10,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+    st.plotly_chart(
+        grafico_tipo_produto(
+            df_tipo_produto,
+        ),
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+        },
+    )
+
+    (
+        tabela_produto,
+        tabela_corretora,
+        tabela_vendedor,
+        tabela_entidade,
+        tabela_tipo,
+    ) = st.tabs(
+        [
+            "Produtos",
+            "Corretoras",
+            "Vendedores",
+            "Entidades",
+            "Tipo de produto",
+        ]
+    )
+
+    with tabela_produto:
+        st.dataframe(
+            df_produtos_ranking,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabela_corretora:
+        st.dataframe(
+            df_corretoras_ranking,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabela_vendedor:
+        st.dataframe(
+            df_vendedores_ranking,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabela_entidade:
+        st.dataframe(
+            df_entidades_ranking,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabela_tipo:
+        st.dataframe(
+            df_tipo_produto,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    nao_classificados = int(
+        df_comercial.loc[
+            df_comercial["Tipo Produto"].eq("Não classificado"),
+            "Descrição Beneficiário",
+        ].count()
+    )
+
+    if nao_classificados:
+        st.info(
+            f"{nao_classificados:,}".replace(",", ".")
+            + " registro(s) possuem Id Acomodação diferente de "
+            "AMB, ENF, QUA ou ODO e foram exibidos como 'Não classificado'."
+        )
+
+
+# ---------------------------------------------------------
+# PRODUÇÃO X EVASÃO POR CORRETORA
+# ---------------------------------------------------------
+with aba_producao_evasao:
+    st.subheader("Produção x Evasão por Corretora")
+
+    st.caption(
+        "Esta visão utiliza os filtros centrais da barra lateral. "
+        "Produção usa a competência da Data Inclusão Vida. "
+        "Evasão usa a competência da Data Fim Beneficiário e conta os cancelamentos considerados. "
+        "Uma vida pode ser produção em um mês e evasão em outro."
+    )
+
+    if saldo_corretoras.empty:
+        st.info(
+            "Não existem registros para o recorte selecionado."
+        )
+
+    else:
+        total_producao_pe = int(
+            saldo_corretoras[
+                "Quantidade de Producao"
+            ].sum()
+        )
+
+        total_evasao_pe = int(
+            saldo_corretoras[
+                "Quantidade de Evasões"
+            ].sum()
+        )
+
+        total_saldo_pe = int(
+            saldo_corretoras[
+                "Saldo"
+            ].sum()
+        )
+
+        corretoras_positivas = int(
+            saldo_corretoras
+            .groupby(
+                "Descrição Corretora"
+            )["Saldo"]
+            .sum()
+            .gt(0)
+            .sum()
+        )
+
+        p1, p2, p3, p4 = st.columns(4)
+
+        p1.metric(
+            "Produção",
+            f"{total_producao_pe:,}".replace(
+                ",",
+                ".",
+            ),
+        )
+
+        p2.metric(
+            "Evasão",
+            f"{total_evasao_pe:,}".replace(
+                ",",
+                ".",
+            ),
+        )
+
+        p3.metric(
+            "Saldo",
+            f"{total_saldo_pe:+,}".replace(
+                ",",
+                ".",
+            ),
+        )
+
+        p4.metric(
+            "Corretoras com saldo positivo",
+            corretoras_positivas,
+        )
+
+        # A produção deve reconciliar com o KPI Saúde + Odonto.
+        if total_producao_pe != total_validos:
+            st.warning(
+                "A produção desta visão não reconciliou com Saúde + Odonto. "
+                f"Produção: {total_producao_pe:,} | Saúde + Odonto: {total_validos:,}"
+                .replace(",", ".")
+            )
+        else:
+            st.success(
+                "Produção reconciliada com o realizado do painel: "
+                f"{total_producao_pe:,}".replace(",", ".")
+            )
+
+        st.plotly_chart(
+            grafico_producao_evasao_competencia(
+                saldo_corretoras
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+        st.plotly_chart(
+            grafico_saldo_corretoras(
+                saldo_corretoras
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+        st.plotly_chart(
+            grafico_motivos_evasao(
+                evasao_corretora_motivos
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+            },
+        )
+
+        tabela_saldo = (
+            saldo_corretoras
+            .copy()
+            .sort_values(
+                [
+                    "Competencia",
+                    "Saldo",
+                ],
+                ascending=[
+                    True,
+                    False,
+                ],
+            )
+        )
+
+        st.markdown(
+            "#### Detalhamento por corretora"
+        )
+
+        st.dataframe(
+            tabela_saldo,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander(
+            "Ver evasões por motivo"
+        ):
+            st.dataframe(
+                evasao_corretora_motivos,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        arquivo_pe = (
+            exportar_producao_evasao_excel(
+                saldo_corretoras,
+                evasao_corretora_motivos,
+            )
+        )
+
+        st.download_button(
+            "Baixar Produção x Evasão em Excel",
+            data=arquivo_pe,
+            file_name="producao_evasao_corretoras.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True,
+        )
+
+
+
+
+# ---------------------------------------------------------
+# CONFERÊNCIA
+# ---------------------------------------------------------
+with aba_conferencia:
+    st.subheader("Conferência do processamento")
+
+    st.markdown(
+        """
+        Esta aba existe para facilitar a comparação do Streamlit
+        com os DataFrames do notebook original.
+        """
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Após merge + filtros de status",
+        f"{len(df_merge_filtrado):,}".replace(",", "."),
+    )
+
+    c2.metric(
+        "Diferença ≤ 0",
+        f"{len(df_certo):,}".replace(",", "."),
+    )
+
+    c3.metric(
+        "Diferença > 0",
+        f"{len(df_nao_corretos):,}".replace(",", "."),
+    )
+
+    with st.expander(
+        "Registros com Diferença > 0"
+    ):
+        st.dataframe(
+            df_nao_corretos,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander(
+        "Base válida após Diferença ≤ 0"
+    ):
+        st.dataframe(
+            df_certo,
+            use_container_width=True,
+            hide_index=True,
+        )
