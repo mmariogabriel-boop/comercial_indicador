@@ -10,8 +10,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from relatorio_pdf_comercial import gerar_relatorio_comercial_pdf
-
 from pipeline_vendedores_internos import (
     VENDEDORES_INTERNOS,
     COLUNAS_PIPELINE,
@@ -134,7 +132,6 @@ COLUNAS_CARTEIRA = [
 # =========================================================
 # LEITURA
 # =========================================================
-@st.cache_data(show_spinner=False, max_entries=4)
 def ler_excel_upload(nome: str, conteudo: bytes) -> pd.DataFrame:
     """
     Lê o arquivo uma única vez e mantém em cache entre os reruns
@@ -246,34 +243,23 @@ def padronizar_colunas_comerciais(
 # =========================================================
 # EVASÃO POR CORRETORA
 # =========================================================
-@st.cache_data(show_spinner=False, max_entries=2)
 def preparar_base_evasao(
-    nome_base: str,
-    bytes_base: bytes,
+    df_base_processada: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Prepara a base de evasão conforme a regra homologada.
+    """Prepara a evasão a partir da Base Total já lida e processada.
 
-    Regra:
-    - Data Fim Beneficiário válida;
+    Isso evita reler a planilha grande apenas para calcular evasão.
+
+    A base recebida já contém:
+    - merge com a carteira;
     - Tipo Movimentação = VIDA NOVA;
-    - Descrição Cancelamento em CANCELAMENTOS_EVASAO;
-    - Competência pela Data Fim Beneficiário.
+    - os cancelamentos comerciais homologados + nulos.
+
+    Regra da evasão:
+    - Data Fim Beneficiário válida;
+    - somente os 6 motivos em CANCELAMENTOS_EVASAO;
+    - Competencia_Evasao = Data Fim Beneficiário.
     """
-
-    df = ler_excel_upload(
-        nome_base,
-        bytes_base,
-    ).copy()
-
-    df.columns = (
-        df.columns
-        .astype(str)
-        .str.strip()
-    )
-
-    df = padronizar_colunas_comerciais(
-        df
-    )
 
     colunas_necessarias = [
         "Descrição Cancelamento",
@@ -285,28 +271,34 @@ def preparar_base_evasao(
     ]
 
     validar_colunas(
-        df,
+        df_base_processada,
         colunas_necessarias,
-        "Base Total - Evasão",
+        "Base processada - Evasão",
     )
 
-    df["Data Fim Beneficiário"] = pd.to_datetime(
-        df["Data Fim Beneficiário"],
+    # Copia somente as colunas necessárias para reduzir memória.
+    df_evasao = df_base_processada[
+        colunas_necessarias
+    ].copy()
+
+    df_evasao["Data Fim Beneficiário"] = pd.to_datetime(
+        df_evasao["Data Fim Beneficiário"],
         dayfirst=True,
         errors="coerce",
     )
 
-    df_evasao = df[
-        df["Data Fim Beneficiário"].notna()
+    df_evasao = df_evasao[
+        df_evasao["Data Fim Beneficiário"].notna()
     ].copy()
 
-    # Competência de EVASÃO:
-    # sempre vinculada à Data Fim Beneficiário.
+    # Competência da EVASÃO = Data Fim Beneficiário.
     df_evasao["Competencia_Evasao"] = (
         df_evasao["Data Fim Beneficiário"]
         .dt.strftime("%m/%Y")
     )
 
+    # A base principal já está em VIDA NOVA,
+    # mas mantemos a condição de forma explícita.
     df_evasao = df_evasao[
         df_evasao["Tipo Movimentação"].eq(
             "VIDA NOVA"
@@ -319,7 +311,6 @@ def preparar_base_evasao(
         )
     ].copy()
 
-    # Padronização igual aos filtros centrais.
     for coluna in [
         "Descrição Material",
         "Descrição Corretora",
@@ -588,7 +579,7 @@ def exportar_producao_evasao_excel(
 # =========================================================
 # PROCESSAMENTO
 # =========================================================
-@st.cache_data(show_spinner=False, max_entries=2)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def processar_bases(
     nome_base: str,
     bytes_base: bytes,
@@ -2671,17 +2662,10 @@ with st.sidebar:
     st.markdown("#### Regras fixas")
     st.caption("Movimentação: VIDA NOVA")
     st.caption(
-        "Cancelamento aceito: SEM JUSTA CAUSA, JUSTA CAUSA, "
+        "Cancelamento comercial aceito: SEM JUSTA CAUSA, JUSTA CAUSA, "
         "A PEDIDO DO BENEFICIÁRIO (RN561), "
         "BENEFÍCIO DEMITIDO/APOSENTADO (RN279), "
         "DESLIGAMENTO DA EMPRESA (RN279), INADIMPLENTE ou vazio."
-        "ATEN ADM - CANCELAMENTO DE CONTRATO, "
-        "RECISÃO POR ACORDO, "
-        "ÓBITO, "
-        "INADIMPLENTE, "
-        "DESISTÊNCIA, "
-
-
     )
     st.caption("Registros válidos: Diferença ≤ 0")
     st.caption("Competências disponíveis: 01/2026 em diante")
@@ -2737,8 +2721,7 @@ except Exception as erro:
 # =========================================================
 try:
     df_evasao_base = preparar_base_evasao(
-        arquivo_base.name,
-        arquivo_base.getvalue(),
+        df_merge_filtrado
     )
 
 except Exception as erro:
@@ -3011,6 +2994,17 @@ with st.sidebar:
         type="primary",
     ):
         with st.spinner("Montando relatório comercial..."):
+            try:
+                from relatorio_pdf_comercial import (
+                    gerar_relatorio_comercial_pdf,
+                )
+            except Exception as erro_pdf_import:
+                st.error(
+                    "Não foi possível carregar o módulo de PDF. "
+                    f"Detalhe: {erro_pdf_import}"
+                )
+                st.stop()
+
             pipeline_pdf = preparar_pipeline(
                 st.session_state.get(
                     "pipeline_vendas_internas",
@@ -3052,8 +3046,9 @@ with st.sidebar:
                     )
                 ].copy()
 
-            st.session_state["relatorio_comercial_pdf"] = (
-                gerar_relatorio_comercial_pdf(
+            try:
+                st.session_state["relatorio_comercial_pdf"] = (
+                    gerar_relatorio_comercial_pdf(
                     logo_path=LOGO_PATH,
                     origem_base=arquivo_base.name,
                     origem_carteira=arquivo_carteira.name,
@@ -3085,9 +3080,14 @@ with st.sidebar:
                     df_entidades_ranking=df_entidades_ranking,
                     df_tipo_produto=df_tipo_produto,
                     df_vendedores_internos=df_vendedores_internos,
-                    df_pipeline_vendas=pipeline_pdf,
+                        df_pipeline_vendas=pipeline_pdf,
+                    )
                 )
-            )
+            except Exception as erro_pdf:
+                st.error(
+                    "O dashboard continua funcionando, mas o PDF não pôde ser gerado. "
+                    f"Detalhe: {erro_pdf}"
+                )
 
     if "relatorio_comercial_pdf" in st.session_state:
         st.download_button(

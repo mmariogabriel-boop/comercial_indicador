@@ -232,3 +232,20 @@ Correção:
 - quantidades são convertidas com pd.to_numeric antes do gráfico.
 
 Essa correção não altera nenhuma regra comercial ou cálculo.
+
+
+CORREÇÃO DE ESTABILIDADE - STREAMLIT CLOUD
+
+O Dashboard Comercial foi otimizado para reduzir o uso de memória:
+
+1. A Base Total não é mais lida novamente para calcular a evasão.
+2. A evasão é derivada da base já processada em memória.
+3. Apenas as colunas necessárias são copiadas para a base de evasão.
+4. O processamento principal usa st.cache_resource com uma única entrada.
+5. A leitura Excel não mantém um segundo cache da Base Total.
+6. matplotlib/reportlab só são importados quando o usuário clica em Gerar relatório PDF.
+7. Uma falha na geração do PDF não derruba mais o restante do dashboard.
+
+REGRAS DE COMPETÊNCIA MANTIDAS:
+- Produção -> Data Inclusão Vida
+- Evasão -> Data Fim Beneficiário
